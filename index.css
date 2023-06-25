@@ -1,0 +1,23 @@
+    li a {
+      font-size: 22px;
+      font-family: 'Courier New', Courier, monospace; /* Optional: you might want to use a different font */
+      color: #fff;
+      text-decoration: none;
+      text-shadow:
+        0 0 5px #ff0000,
+        0 0 10px #ff0000,
+        0 0 15px #ff0000,
+        0 0 20px #ff0000,
+        0 0 30px #ff0000,
+        0 0 40px #ff0000;
+    }
+
+    li a:hover {
+      text-shadow:
+        0 0 5px #ffffff,
+        0 0 10px #ffffff,
+        0 0 15px #ffffff,
+        0 0 20px #ffffff,
+        0 0 30px #ffffff,
+        0 0 40px #ffffff;
+    }
