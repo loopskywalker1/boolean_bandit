@@ -14,12 +14,12 @@
 
     li a:hover {
       text-shadow:
-        0 0 5px #ffffff,
-        0 0 10px #ffffff,
-        0 0 15px #ffffff,
-        0 0 20px #ffffff,
-        0 0 30px #ffffff,
-        0 0 40px #ffffff;
+        0 0 5px #0000ff,
+        0 0 10px #0000ff,
+        0 0 15px #0000ff,
+        0 0 20px #0000ff,
+        0 0 30px #0000ff,
+        0 0 40px #0000ff;
     }
 
 /* Small screens (default) */
