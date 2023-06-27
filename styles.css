@@ -61,6 +61,18 @@ li a:hover {
     0 0 40px #0000ff;
 }
 
+#swirl {
+  position: fixed;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background-color: rgba(0,0,255,0.5);
+  pointer-events: none;
+  z-index: -1; /* This places the swirl behind other content on the page */
+  transition: transform 0.1s, opacity 0.1s;
+  opacity: 0;
+}
+
 /* Small screens (default) */
 body {
   font-size: 18px;
