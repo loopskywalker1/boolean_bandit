@@ -72,6 +72,9 @@ h1 {
 
 /* Medium screens (640px) */
 @media (min-width: 640px) {
+  li a {
+    font-size: 32px; /* Increase font size for smaller screens */
+  }
   body {
     font-size: 20px;
   }
@@ -82,6 +85,9 @@ h1 {
 
 /* Large screens (1024px) */
 @media (min-width: 1024px) {
+  li a {
+    font-size: 32px; /* Increase font size for smaller screens */
+  }
   body {
     font-size: 22px;
   }
