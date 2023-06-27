@@ -44,5 +44,17 @@
     <li><a href="#newsletter">Newsletter</a></li>
     <li><a href="#donate">Donate</a></li>
   </ul>
+  <script>
+    window.addEventListener('mousemove', (event) => {
+      const swirl = document.getElementById('swirl');
+      swirl.style.transform = `translate(${event.pageX - 25}px, ${event.pageY - 25}px)`;
+      swirl.style.opacity = 1;
+    });
+    
+    window.addEventListener('mouseout', () => {
+      const swirl = document.getElementById('swirl');
+      swirl.style.opacity = 0;
+    });
+  </script>
 </body>
 </html>
