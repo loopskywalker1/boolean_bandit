@@ -3,6 +3,7 @@
 <head>
   <title>Jonah Approved</title>
   <link rel="stylesheet" type="text/css" href="styles.css">
+  <script src="path/to/particles.min.js"></script>
   <style>
     /* Add styles for the navigation menu here */
     ul {
@@ -38,6 +39,7 @@
 </head>
 <body>
   <div id="swirl"></div>
+  <div id="particles-js"></div>
   <ul>
     <li><a href="#golden">The Golden List</a></li>
     <li><a href="#join">Join</a></li>
@@ -55,6 +57,21 @@
       const swirl = document.getElementById('swirl');
       swirl.style.opacity = 0;
     });
+    particlesJS('particles-js', {
+    particles: {
+      number: { value: 200 },
+      color: { value: '#ffffff' }, // Change the color as per your need
+      shape: { type: 'circle' },
+      size: { value: 3 },
+      line_linked: { enable: false },
+      move: { speed: 1 }
+    },
+    interactivity: {
+      events: {
+        onhover: { enable: true, mode: 'repulse' }
+      }
+    }
+  });
   </script>
 </body>
 </html>
