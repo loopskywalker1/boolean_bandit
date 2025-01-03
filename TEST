@@ -1,5 +1,158 @@
-# Step 1: Create elasticsearch.yaml
+# 01-namespace.yaml
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+
+---
+# 02-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-operator
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: elastic-operator
+rules:
+- apiGroups: [""]
+  resources: ["pods", "endpoints", "events", "persistentvolumeclaims", "secrets", "services", "configmaps", "serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["cronjobs", "jobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["elasticsearch.k8s.elastic.co"]
+  resources: ["elasticsearches", "elasticsearches/status", "elasticsearches/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["kibana.k8s.elastic.co"]
+  resources: ["kibanas", "kibanas/status", "kibanas/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apm.k8s.elastic.co"]
+  resources: ["apmservers", "apmservers/status", "apmservers/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["agent.k8s.elastic.co"]
+  resources: ["agents", "agents/status", "agents/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["beat.k8s.elastic.co"]
+  resources: ["beats", "beats/status", "beats/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: elastic-operator
+subjects:
+- kind: ServiceAccount
+  name: elastic-operator
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: elastic-operator
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-server
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fleet-server
+  namespace: monitoring
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["agent.k8s.elastic.co"]
+  resources: ["agents"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-server
+  namespace: monitoring
+subjects:
+- kind: ServiceAccount
+  name: fleet-server
+  namespace: monitoring
+roleRef:
+  kind: Role
+  name: fleet-server
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: elastic-agent
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "namespaces", "events", "pods", "services", "configmaps", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets", "deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: elastic-agent
+subjects:
+- kind: ServiceAccount
+  name: elastic-agent
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: elastic-agent
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# 03-elasticsearch.yaml
 apiVersion: elasticsearch.k8s.elastic.co/v1
 kind: Elasticsearch
 metadata:
@@ -14,7 +167,9 @@ spec:
         node.roles: ["master"]
         node.store.allow_mmap: false
         xpack.security.enabled: true
+        xpack.security.transport.ssl.enabled: true
         xpack.security.http.ssl.enabled: true
+        ingest.geoip.downloader.enabled: false
       podTemplate:
         spec:
           initContainers:
@@ -27,8 +182,10 @@ spec:
             resources:
               requests:
                 memory: 4Gi
+                cpu: "1000m"
               limits:
                 memory: 10Gi
+                cpu: "2000m"
             env:
             - name: ES_JAVA_OPTS
               value: "-Xms2g -Xmx2g"
@@ -47,7 +204,9 @@ spec:
         node.roles: ["data", "ingest"]
         node.store.allow_mmap: false
         xpack.security.enabled: true
+        xpack.security.transport.ssl.enabled: true
         xpack.security.http.ssl.enabled: true
+        ingest.geoip.downloader.enabled: false
       podTemplate:
         spec:
           initContainers:
@@ -60,8 +219,10 @@ spec:
             resources:
               requests:
                 memory: 4Gi
+                cpu: "1000m"
               limits:
                 memory: 10Gi
+                cpu: "2000m"
             env:
             - name: ES_JAVA_OPTS
               value: "-Xms2g -Xmx2g"
@@ -76,7 +237,7 @@ spec:
             storageClassName: longhorn
 
 ---
-# Step 2: Create kibana.yaml
+# 04-kibana.yaml
 apiVersion: kibana.k8s.elastic.co/v1
 kind: Kibana
 metadata:
@@ -121,7 +282,7 @@ spec:
         disabled: true
 
 ---
-# Step 3: Create fleet-server.yaml
+# 05-fleet-server.yaml
 apiVersion: agent.k8s.elastic.co/v1alpha1
 kind: Agent
 metadata:
@@ -139,6 +300,7 @@ spec:
     replicas: 1
     podTemplate:
       spec:
+        serviceAccountName: fleet-server
         securityContext:
           runAsUser: 1000
           fsGroup: 1000
@@ -153,7 +315,7 @@ spec:
                 cpu: "500m"
 
 ---
-# Step 4: Create elastic-agent.yaml
+# 06-elastic-agent.yaml
 apiVersion: agent.k8s.elastic.co/v1alpha1
 kind: Agent
 metadata:
@@ -170,6 +332,7 @@ spec:
     replicas: 1
     podTemplate:
       spec:
+        serviceAccountName: elastic-agent
         securityContext:
           runAsUser: 1000
           fsGroup: 1000
@@ -184,7 +347,7 @@ spec:
                 cpu: "300m"
 
 ---
-# Step 5: Create ingress.yaml
+# 07-ingress.yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -200,10 +363,10 @@ spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - site.com
+    - .org
     secretName: dords-tls
   rules:
-  - host: site.com
+  - host: .org
     http:
       paths:
       - path: /
