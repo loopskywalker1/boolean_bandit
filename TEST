@@ -1,0 +1,215 @@
+# Step 1: Create elasticsearch.yaml
+---
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch
+  namespace: monitoring
+spec:
+  version: 8.17.0
+  nodeSets:
+    - name: master-nodes
+      count: 3
+      config:
+        node.roles: ["master"]
+        node.store.allow_mmap: false
+        xpack.security.enabled: true
+        xpack.security.http.ssl.enabled: true
+      podTemplate:
+        spec:
+          initContainers:
+          - name: sysctl
+            securityContext:
+              privileged: true
+            command: ['sh', '-c', 'sysctl -w vm.max_map_count=262144']
+          containers:
+          - name: elasticsearch
+            resources:
+              requests:
+                memory: 4Gi
+              limits:
+                memory: 10Gi
+            env:
+            - name: ES_JAVA_OPTS
+              value: "-Xms2g -Xmx2g"
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 100Gi
+            storageClassName: longhorn
+    - name: data-nodes
+      count: 3
+      config:
+        node.roles: ["data", "ingest"]
+        node.store.allow_mmap: false
+        xpack.security.enabled: true
+        xpack.security.http.ssl.enabled: true
+      podTemplate:
+        spec:
+          initContainers:
+          - name: sysctl
+            securityContext:
+              privileged: true
+            command: ['sh', '-c', 'sysctl -w vm.max_map_count=262144']
+          containers:
+          - name: elasticsearch
+            resources:
+              requests:
+                memory: 4Gi
+              limits:
+                memory: 10Gi
+            env:
+            - name: ES_JAVA_OPTS
+              value: "-Xms2g -Xmx2g"
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 250Gi
+            storageClassName: longhorn
+
+---
+# Step 2: Create kibana.yaml
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kibana
+  namespace: monitoring
+spec:
+  version: 8.17.0
+  count: 1
+  elasticsearchRef:
+    name: elasticsearch
+  podTemplate:
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: wait-for-elasticsearch
+        image: busybox:1.28
+        command: ['sh', '-c', 'until wget -T 5 --spider http://elasticsearch-es-http:9200; do echo waiting for elasticsearch; sleep 20; done;']
+      containers:
+        - name: kibana
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1800"
+            - name: ELASTICSEARCH_SSL_VERIFICATIONMODE
+              value: "none"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+  http:
+    service:
+      spec:
+        ports:
+        - name: http
+          port: 5601
+          targetPort: 5601
+    tls:
+      selfSignedCertificate:
+        disabled: true
+
+---
+# Step 3: Create fleet-server.yaml
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata:
+  name: fleet-server
+  namespace: monitoring
+spec:
+  version: 8.17.0
+  kibanaRef:
+    name: kibana
+  elasticsearchRefs:
+    - name: elasticsearch
+  mode: fleet
+  fleetServerEnabled: true
+  deployment:
+    replicas: 1
+    podTemplate:
+      spec:
+        securityContext:
+          runAsUser: 1000
+          fsGroup: 1000
+        containers:
+          - name: agent
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "200m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"
+
+---
+# Step 4: Create elastic-agent.yaml
+apiVersion: agent.k8s.elastic.co/v1alpha1
+kind: Agent
+metadata:
+  name: elastic-agent
+  namespace: monitoring
+spec:
+  version: 8.17.0
+  kibanaRef:
+    name: kibana
+  fleetServerRef:
+    name: fleet-server
+  mode: fleet
+  deployment:
+    replicas: 1
+    podTemplate:
+      spec:
+        securityContext:
+          runAsUser: 1000
+          fsGroup: 1000
+        containers:
+          - name: agent
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "300m"
+
+---
+# Step 5: Create ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elk-ingress
+  namespace: monitoring
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - site.com
+    secretName: dords-tls
+  rules:
+  - host: site.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kibana-kb-http
+            port:
+              number: 5601
