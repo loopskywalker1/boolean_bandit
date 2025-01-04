@@ -156,3 +156,79 @@ spec:
             name: kibana-kb-http
             port:
               number: 5601
+
+
+-----------
+
+# 1. Remove existing deployments
+kubectl delete kibana -n monitoring kibana
+kubectl delete elasticsearch -n monitoring elasticsearch
+kubectl delete ingress -n monitoring --all
+kubectl delete service -n monitoring --all
+
+# 2. Clean up secrets and config maps
+kubectl delete secret -n monitoring --all
+kubectl delete configmap -n monitoring --all
+
+# 3. Clean up namespaces
+kubectl delete namespace monitoring
+kubectl delete namespace elastic-system
+
+# 4. Remove Helm ECK operator
+helm uninstall elastic-operator -n elastic-system
+
+
+kubectl create namespace elastic-system
+kubectl create namespace monitoring
+---------------
+
+
+# Add Elastic repo if not already added
+helm repo add elastic https://helm.elastic.co
+helm repo update
+
+# Install ECK operator
+helm install elastic-operator elastic/eck-operator -n elastic-system --version 2.11.1
+
+# Verify operator is running
+kubectl get pods -n elastic-system -w
+
+------------------
+
+kubectl apply -f elasticsearch.yaml
+
+# Watch Elasticsearch pods
+kubectl get pods -n monitoring -w
+
+# Wait until all pods are Running and Ready (1/1 for master, 1/1 for data nodes)
+
+-----------------
+
+# Get elastic user password
+kubectl get secret elasticsearch-es-elastic-user -n monitoring -o=jsonpath='{.data.elastic}' | base64 --decode; echo
+
+# Verify cluster health (replace PASSWORD with the one from above)
+kubectl exec -it elasticsearch-es-master-nodes-0 -n monitoring -- curl -k -u "elastic:PASSWORD" https://localhost:9200/_cluster/health
+
+# Check if security index exists
+kubectl exec -it elasticsearch-es-master-nodes-0 -n monitoring -- curl -k -u "elastic:PASSWORD" https://localhost:9200/_cat/indices
+
+---------
+kubectl apply -f kibana.yaml
+
+# Watch Kibana pod
+kubectl get pods -n monitoring -w
+
+----------
+
+kubectl apply -f ingress.yaml
+
+-------
+# Check all pods
+kubectl get pods -n monitoring
+
+# Check services
+kubectl get svc -n monitoring
+
+# Check ingress
+kubectl get ingress -n monitoring
