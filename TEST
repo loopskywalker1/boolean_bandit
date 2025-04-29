@@ -1,35 +1,10 @@
+# First, ensure res_dir is defined before run_experiment is called
 # Add this near the top of your base_run_mini.R file
-# Create a log directory alongside your results directory
-log_dir <- paste(dirname(res_dir), "logs", sep='/')
-dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+res_dir <- paste('results', 'dpg3_mini', 'base_run', 'experiments', sep='/')
+ensure_dir_exists(res_dir)  # Make sure this function is defined
 
-# Create a log file with timestamp
-log_timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-log_file <- file.path(log_dir, paste0("experiment_log_", log_timestamp, ".txt"))
-
-# Function to write to log file and console
-log_message <- function(msg) {
-  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  full_msg <- paste0("[", timestamp, "] ", msg)
-  
-  # Print to console
-  cat(full_msg, "\n")
-  
-  # Append to log file
-  cat(full_msg, "\n", file=log_file, append=TRUE)
-}
-
-# Then replace your cat() statements with log_message()
-# For example:
-
-# Instead of: cat("starting experiments")
-log_message("Starting experiments with 8 workers")
-
-# Modify run_experiment function to use logging
+# Then modify run_experiment function to add worker ID to filename
 run_experiment <- function(run_index) {
-  worker_id <- Sys.getpid()
-  log_message(paste0("Worker ", worker_id, " starting run ", run_index))
-  
   # Your existing code
   result <- params %>% pmap_df(experiment,
     hist_lrnr = prog3,
@@ -39,28 +14,28 @@ run_experiment <- function(run_index) {
   
   result$seed <- experimental_seed
   
-  # Add uniqueness to filename
+  # Add uniqueness to prevent conflicts
+  worker_id <- Sys.getpid()  # Get process ID
   timestamp <- format(Sys.time(), "%H%M%S")
   output_filename <- paste0("experiment_result_run_", run_index, "_worker", worker_id, "_", timestamp, ".parquet")
+  
+  # Use file.path for proper path construction
   full_path <- file.path(res_dir, output_filename)
   
-  # Log before writing
-  log_message(paste0("Worker ", worker_id, " writing file for run ", run_index, " to: ", full_path))
-  
-  # Ensure directory exists
-  dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
+  # Optional debugging output
+  cat(paste0("Writing file for run ", run_index, " to: ", full_path, "\n"))
   
   # Write with error handling
   tryCatch({
     write_parquet(result, full_path)
-    log_message(paste0("Worker ", worker_id, " successfully wrote file for run ", run_index))
+    cat(paste0("Successfully wrote file for run ", run_index, "\n"))
   }, error = function(e) {
-    log_message(paste0("ERROR: Worker ", worker_id, " failed to write file for run ", run_index, ": ", e$message))
+    cat(paste0("ERROR writing file for run ", run_index, ": ", e$message, "\n"))
   })
   
   return(run_index)
 }
 
-# Keep using your parallel execution
+# Keep your existing parallel execution code
 # n_runs <- 8
 # future_walk(1:n_runs, run_experiment, .options = options)
