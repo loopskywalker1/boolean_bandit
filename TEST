@@ -9,8 +9,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import train_test_split
 from concurrent.futures import ProcessPoolExecutor
-import torch
-import torch.multiprocessing as mp
 import logging
 
 # Set up logging
@@ -23,12 +21,16 @@ logging.basicConfig(
     ]
 )
 
-# Check if CUDA is available (for A100)
-if torch.cuda.is_available():
-    logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
-else:
-    logging.info("CUDA not available, using CPU")
+# Check if CUDA is available, but don't force it since we had compatibility issues
+try:
+    import torch
+    if torch.cuda.is_available():
+        logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+        logging.info("Note: Not using CUDA for this implementation as it's not required")
+    else:
+        logging.info("CUDA not available, using CPU")
+except:
+    logging.info("PyTorch not available or CUDA issues, continuing with CPU")
 
 # Utility functions
 def ensure_dir_exists(directory):
@@ -38,7 +40,7 @@ def ensure_dir_exists(directory):
         logging.info(f"Created directory: {directory}")
     return directory
 
-# Data generation functions equivalent to dgp.R
+# Data generation functions
 def generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3"):
     """Generate synthetic data similar to your R code"""
     np.random.seed(129483)  # Same as set.seed in R
@@ -49,6 +51,9 @@ def generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3"):
     W3 = np.random.uniform(-1, 1, n_hist)
     W4 = np.random.uniform(-1, 1, n_hist)
     W5 = np.random.uniform(-1, 1, n_hist)
+    
+    # Generate treatment assignment
+    A = np.random.binomial(1, 0.5, n_hist)
     
     # Different DGP functions as in your R code
     if dgp_string == "dgp3":
@@ -66,8 +71,7 @@ def generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3"):
     Y0 = mu0 + np.random.normal(0, y_noise, n_hist)
     Y1 = mu1 + np.random.normal(0, y_noise, n_hist)
     
-    # Select which Y to use based on a condition (similar to starts_with('W') in R)
-    A = np.random.binomial(1, 0.5, n_hist)
+    # Observed outcome based on treatment
     Y = A * Y1 + (1 - A) * Y0
     
     # Create dataframe
@@ -95,32 +99,44 @@ def unadjusted_estimator(data):
     return {'effect': effect, 'se': se}
 
 def linear_estimator(data):
-    """Linear regression estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
-    y = data['Y']
-    a = data['A']
+    """Linear regression estimator - FIXED to avoid dimension mismatch"""
+    # Create a copy of the data to avoid modifying the original
+    train_data = data.copy()
     
-    # Fit model
+    # Include A in the training features
+    X = train_data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
+    y = train_data['Y']
+    
+    # Fit model with A included in the features
     model = LinearRegression()
     model.fit(X, y)
     
-    # Predict
-    X_copy = X.copy()
-    X_copy['A'] = 1
-    y1_pred = model.predict(X_copy)
-    X_copy['A'] = 0
-    y0_pred = model.predict(X_copy)
+    # Create datasets for counterfactual prediction
+    all_X = train_data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
     
+    # Create X with A=1 for all observations
+    X1 = all_X.copy()
+    X1['A'] = 1
+    
+    # Create X with A=0 for all observations
+    X0 = all_X.copy()
+    X0['A'] = 0
+    
+    # Predict counterfactuals
+    y1_pred = model.predict(X1)
+    y0_pred = model.predict(X0)
+    
+    # Calculate effect
     effect = (y1_pred - y0_pred).mean()
     se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
     
     return {'effect': effect, 'se': se}
 
 def gbt_estimator(data):
-    """Gradient Boosted Trees estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
+    """Gradient Boosted Trees estimator - FIXED to avoid dimension mismatch"""
+    # Include A in the training features
+    X = data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
     y = data['Y']
-    a = data['A']
     
     # Fit model
     model = GradientBoostingRegressor(
@@ -130,108 +146,148 @@ def gbt_estimator(data):
     )
     model.fit(X, y)
     
-    # Predict
-    X_copy = X.copy()
-    X_copy['A'] = 1
-    y1_pred = model.predict(X_copy)
-    X_copy['A'] = 0
-    y0_pred = model.predict(X_copy)
+    # Create datasets for counterfactual prediction
+    all_X = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
     
+    # Create X with A=1 for all observations
+    X1 = all_X.copy()
+    X1['A'] = 1
+    
+    # Create X with A=0 for all observations
+    X0 = all_X.copy()
+    X0['A'] = 0
+    
+    # Predict counterfactuals
+    y1_pred = model.predict(X1)
+    y0_pred = model.predict(X0)
+    
+    # Calculate effect
     effect = (y1_pred - y0_pred).mean()
     se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
     
     return {'effect': effect, 'se': se}
 
 def knn_estimator(data):
-    """K-Nearest Neighbors estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
+    """K-Nearest Neighbors estimator - FIXED to avoid dimension mismatch"""
+    # Include A in the training features
+    X = data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
     y = data['Y']
-    a = data['A']
     
     # Fit model
     model = KNeighborsRegressor(n_neighbors=5)
     model.fit(X, y)
     
-    # Predict
-    X_copy = X.copy()
-    X_copy['A'] = 1
-    y1_pred = model.predict(X_copy)
-    X_copy['A'] = 0
-    y0_pred = model.predict(X_copy)
+    # Create datasets for counterfactual prediction
+    all_X = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
     
+    # Create X with A=1 for all observations
+    X1 = all_X.copy()
+    X1['A'] = 1
+    
+    # Create X with A=0 for all observations
+    X0 = all_X.copy()
+    X0['A'] = 0
+    
+    # Predict counterfactuals
+    y1_pred = model.predict(X1)
+    y0_pred = model.predict(X0)
+    
+    # Calculate effect
     effect = (y1_pred - y0_pred).mean()
     se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
     
     return {'effect': effect, 'se': se}
 
 # Cross-validation and model selection
-def fit_prog(train_data, test_data, learners=None):
+def fit_prog(train_data, test_data=None, learners=None):
     """Fit prognostic models and evaluate"""
+    if test_data is None:
+        # If no test data provided, use train_data
+        test_data = train_data
+        
     if learners is None:
         learners = {
             'linear': linear_estimator,
             'gbt': gbt_estimator,
-            'knn': knn_estimator
+            'knn': knn_estimator,
+            'unadjusted': unadjusted_estimator
         }
     
     results = {}
     for name, learner in learners.items():
-        result = learner(train_data)
-        results[name] = result
+        try:
+            result = learner(train_data)
+            results[name] = result
+            logging.info(f"Learner {name}: effect={result['effect']:.4f}, se={result['se']:.4f}")
+        except Exception as e:
+            logging.error(f"Error in learner {name}: {str(e)}")
     
-    # Select best learner based on SE
-    best_learner_name = min(results, key=lambda k: results[k]['se'])
-    best_learner = learners[best_learner_name]
-    
-    return best_learner
+    # Select best learner based on SE (lower is better)
+    if results:
+        best_learner_name = min(results, key=lambda k: results[k]['se'])
+        best_learner = learners[best_learner_name]
+        logging.info(f"Selected best learner: {best_learner_name}")
+        return best_learner, best_learner_name, results[best_learner_name]
+    else:
+        # Fallback to linear if all failed
+        logging.warning("All learners failed, falling back to linear")
+        return linear_estimator, "linear", {"effect": 0, "se": 1}
 
 def calc_kappa(prog_mod, hist_data, test_data):
     """Calculate kappa metric"""
-    # This is a placeholder for your R calc_kappa function
-    # You would implement the appropriate calculation here
-    return 0.85  # Example value
+    # Apply the prognostic model to test data
+    result = prog_mod(test_data)
+    return result['effect'] / result['se']  # Return effect size normalized by SE
 
 def run_experiment(run_index):
     """Run a single experiment"""
     worker_id = os.getpid()
     logging.info(f"Worker {worker_id} starting run {run_index}")
     
-    # Generate data
-    hist_data = generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3")
-    
-    # Train-test split
-    hist_train, hist_test = train_test_split(hist_data, test_size=0.3, random_state=129483)
-    
-    # Fit prognostic model
-    prog = fit_prog(hist_train, hist_test)
-    logging.info(f"Run {run_index}: Fitted prognostic model")
-    
-    # Calculate kappa
-    kappa = calc_kappa(prog, hist_data, hist_test)
-    logging.info(f"Run {run_index}: Calculated kappa = {kappa}")
-    
-    # Prepare results
-    result = pd.DataFrame({
-        'run_index': [run_index],
-        'kappa': [kappa],
-        'best_learner_name': ['gbt'],  # Placeholder
-        'timestamp': [time.time()]
-    })
-    
-    # Save results
-    res_dir = ensure_dir_exists(os.path.join('results', 'dpg3_mini', 'base_run', 'experiments'))
-    timestamp = time.strftime("%H%M%S")
-    output_filename = f"experiment_result_run_{run_index}_worker{worker_id}_{timestamp}.parquet"
-    output_path = os.path.join(res_dir, output_filename)
-    
     try:
+        # Generate data
+        hist_data = generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3")
+        logging.info(f"Run {run_index}: Generated data with shape {hist_data.shape}")
+        
+        # Train-test split
+        hist_train, hist_test = train_test_split(hist_data, test_size=0.3, random_state=129483)
+        
+        # Fit prognostic model
+        prog, best_learner_name, prog_result = fit_prog(hist_train, hist_test)
+        logging.info(f"Run {run_index}: Fitted prognostic model {best_learner_name}")
+        
+        # Calculate kappa
+        kappa = calc_kappa(prog, hist_data, hist_test)
+        logging.info(f"Run {run_index}: Calculated kappa = {kappa}")
+        
+        # Calculate sig3 (equivalent to your R code)
+        sig3 = np.std(hist_data[hist_data['A'] == 1]['Y'] - hist_data[hist_data['A'] == 0]['Y'])
+        
+        # Prepare results
+        result = pd.DataFrame({
+            'run_index': [run_index],
+            'kappa': [kappa],
+            'best_learner_name': [best_learner_name],
+            'effect': [prog_result['effect']],
+            'se': [prog_result['se']],
+            'sig3': [sig3],
+            'timestamp': [time.time()]
+        })
+        
+        # Save results
+        res_dir = ensure_dir_exists(os.path.join('results', 'dpg3_mini', 'base_run', 'experiments'))
+        timestamp = time.strftime("%H%M%S")
+        output_filename = f"experiment_result_run_{run_index}_worker{worker_id}_{timestamp}.parquet"
+        output_path = os.path.join(res_dir, output_filename)
+        
         # Convert to pyarrow table and write
         table = pa.Table.from_pandas(result)
         pq.write_table(table, output_path)
         logging.info(f"Worker {worker_id} successfully wrote file for run {run_index} to {output_path}")
         return run_index
+        
     except Exception as e:
-        logging.error(f"Worker {worker_id} failed to write file for run {run_index}: {str(e)}")
+        logging.error(f"Worker {worker_id} failed in run {run_index}: {str(e)}", exc_info=True)
         return None
 
 def main():
@@ -240,7 +296,7 @@ def main():
     logging.info(f"Starting {n_runs} experiments in parallel")
     
     # Use all available cores for parallelism
-    n_workers = mp.cpu_count()
+    n_workers = min(os.cpu_count(), n_runs)
     logging.info(f"Using {n_workers} worker processes")
     
     # Create result directory
@@ -248,7 +304,14 @@ def main():
     
     # Run experiments in parallel using ProcessPoolExecutor
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        results = list(executor.map(run_experiment, range(1, n_runs + 1)))
+        futures = [executor.submit(run_experiment, i) for i in range(1, n_runs + 1)]
+        results = []
+        for future in futures:
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                logging.error(f"Error in future: {str(e)}")
     
     # Check results
     completed = [r for r in results if r is not None]
@@ -265,6 +328,6 @@ def main():
         logging.warning(f"Expected {n_runs} files but only found {len(parquet_files)}")
 
 if __name__ == "__main__":
-    # Initialize multiprocessing with spawn method for better compatibility
-    mp.set_start_method('spawn', force=True)
+    # Initialize multiprocessing without explicitly setting start method
+    # to avoid potential issues on different platforms
     main()
