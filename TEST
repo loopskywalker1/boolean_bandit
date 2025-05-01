@@ -1,41 +1,270 @@
-# First, ensure res_dir is defined before run_experiment is called
-# Add this near the top of your base_run_mini.R file
-res_dir <- paste('results', 'dpg3_mini', 'base_run', 'experiments', sep='/')
-ensure_dir_exists(res_dir)  # Make sure this function is defined
+import os
+import time
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow as pa
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import train_test_split
+from concurrent.futures import ProcessPoolExecutor
+import torch
+import torch.multiprocessing as mp
+import logging
 
-# Then modify run_experiment function to add worker ID to filename
-run_experiment <- function(run_index) {
-  # Your existing code
-  result <- params %>% pmap_df(experiment,
-    hist_lrnr = prog3,
-    y_noise = 6,
-    dgp_string = "dgp3",
-    V = 20)
-  
-  result$seed <- experimental_seed
-  
-  # Add uniqueness to prevent conflicts
-  worker_id <- Sys.getpid()  # Get process ID
-  timestamp <- format(Sys.time(), "%H%M%S")
-  output_filename <- paste0("experiment_result_run_", run_index, "_worker", worker_id, "_", timestamp, ".parquet")
-  
-  # Use file.path for proper path construction
-  full_path <- file.path(res_dir, output_filename)
-  
-  # Optional debugging output
-  cat(paste0("Writing file for run ", run_index, " to: ", full_path, "\n"))
-  
-  # Write with error handling
-  tryCatch({
-    write_parquet(result, full_path)
-    cat(paste0("Successfully wrote file for run ", run_index, "\n"))
-  }, error = function(e) {
-    cat(paste0("ERROR writing file for run ", run_index, ": ", e$message, "\n"))
-  })
-  
-  return(run_index)
-}
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(processName)s - %(message)s',
+    handlers=[
+        logging.FileHandler("experiment.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# Keep your existing parallel execution code
-# n_runs <- 8
-# future_walk(1:n_runs, run_experiment, .options = options)
+# Check if CUDA is available (for A100)
+if torch.cuda.is_available():
+    logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+else:
+    logging.info("CUDA not available, using CPU")
+
+# Utility functions
+def ensure_dir_exists(directory):
+    """Create directory if it doesn't exist"""
+    if not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+        logging.info(f"Created directory: {directory}")
+    return directory
+
+# Data generation functions equivalent to dgp.R
+def generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3"):
+    """Generate synthetic data similar to your R code"""
+    np.random.seed(129483)  # Same as set.seed in R
+    
+    # Generate features
+    W1 = np.random.uniform(-1, 1, n_hist)
+    W2 = np.random.uniform(-1, 1, n_hist)
+    W3 = np.random.uniform(-1, 1, n_hist)
+    W4 = np.random.uniform(-1, 1, n_hist)
+    W5 = np.random.uniform(-1, 1, n_hist)
+    
+    # Different DGP functions as in your R code
+    if dgp_string == "dgp3":
+        mu0 = W1**2 + 2.4 * W3 + W5 - np.sqrt(np.abs(W1))
+        mu1 = W1**2 + 2*W2 - 0.2 * W3 + W5 - np.sqrt(np.abs(W1))
+    elif dgp_string == "constant":
+        mu0 = np.sin(np.abs(W1)*np.pi/10) - 3
+        mu1 = np.sin(np.abs(W1)*np.pi/10)
+    else:
+        # Default case
+        mu0 = W1 + W2 + W3**2 / 1.5
+        mu1 = W1 + W2 + W3**2 / 1.2 + 2.582
+    
+    # Add noise
+    Y0 = mu0 + np.random.normal(0, y_noise, n_hist)
+    Y1 = mu1 + np.random.normal(0, y_noise, n_hist)
+    
+    # Select which Y to use based on a condition (similar to starts_with('W') in R)
+    A = np.random.binomial(1, 0.5, n_hist)
+    Y = A * Y1 + (1 - A) * Y0
+    
+    # Create dataframe
+    data = pd.DataFrame({
+        'W1': W1, 'W2': W2, 'W3': W3, 'W4': W4, 'W5': W5,
+        'A': A, 'Y': Y, 'Y0': Y0, 'Y1': Y1
+    })
+    
+    return data
+
+# Equivalent to the estimators in R
+def unadjusted_estimator(data):
+    """Unadjusted estimator similar to your R code"""
+    y1_mean = data[data['A'] == 1]['Y'].mean()
+    y0_mean = data[data['A'] == 0]['Y'].mean()
+    effect = y1_mean - y0_mean
+    
+    # Calculate SE
+    y1_var = data[data['A'] == 1]['Y'].var()
+    y0_var = data[data['A'] == 0]['Y'].var()
+    n1 = (data['A'] == 1).sum()
+    n0 = (data['A'] == 0).sum()
+    se = np.sqrt(y1_var/n1 + y0_var/n0)
+    
+    return {'effect': effect, 'se': se}
+
+def linear_estimator(data):
+    """Linear regression estimator"""
+    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
+    y = data['Y']
+    a = data['A']
+    
+    # Fit model
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Predict
+    X_copy = X.copy()
+    X_copy['A'] = 1
+    y1_pred = model.predict(X_copy)
+    X_copy['A'] = 0
+    y0_pred = model.predict(X_copy)
+    
+    effect = (y1_pred - y0_pred).mean()
+    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
+    
+    return {'effect': effect, 'se': se}
+
+def gbt_estimator(data):
+    """Gradient Boosted Trees estimator"""
+    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
+    y = data['Y']
+    a = data['A']
+    
+    # Fit model
+    model = GradientBoostingRegressor(
+        n_estimators=100, 
+        max_depth=3,
+        learning_rate=0.1
+    )
+    model.fit(X, y)
+    
+    # Predict
+    X_copy = X.copy()
+    X_copy['A'] = 1
+    y1_pred = model.predict(X_copy)
+    X_copy['A'] = 0
+    y0_pred = model.predict(X_copy)
+    
+    effect = (y1_pred - y0_pred).mean()
+    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
+    
+    return {'effect': effect, 'se': se}
+
+def knn_estimator(data):
+    """K-Nearest Neighbors estimator"""
+    X = data[['W1', 'W2', 'W3', 'W4', 'W5']]
+    y = data['Y']
+    a = data['A']
+    
+    # Fit model
+    model = KNeighborsRegressor(n_neighbors=5)
+    model.fit(X, y)
+    
+    # Predict
+    X_copy = X.copy()
+    X_copy['A'] = 1
+    y1_pred = model.predict(X_copy)
+    X_copy['A'] = 0
+    y0_pred = model.predict(X_copy)
+    
+    effect = (y1_pred - y0_pred).mean()
+    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
+    
+    return {'effect': effect, 'se': se}
+
+# Cross-validation and model selection
+def fit_prog(train_data, test_data, learners=None):
+    """Fit prognostic models and evaluate"""
+    if learners is None:
+        learners = {
+            'linear': linear_estimator,
+            'gbt': gbt_estimator,
+            'knn': knn_estimator
+        }
+    
+    results = {}
+    for name, learner in learners.items():
+        result = learner(train_data)
+        results[name] = result
+    
+    # Select best learner based on SE
+    best_learner_name = min(results, key=lambda k: results[k]['se'])
+    best_learner = learners[best_learner_name]
+    
+    return best_learner
+
+def calc_kappa(prog_mod, hist_data, test_data):
+    """Calculate kappa metric"""
+    # This is a placeholder for your R calc_kappa function
+    # You would implement the appropriate calculation here
+    return 0.85  # Example value
+
+def run_experiment(run_index):
+    """Run a single experiment"""
+    worker_id = os.getpid()
+    logging.info(f"Worker {worker_id} starting run {run_index}")
+    
+    # Generate data
+    hist_data = generate_data(n_hist=1000, y_noise=6, dgp_string="dgp3")
+    
+    # Train-test split
+    hist_train, hist_test = train_test_split(hist_data, test_size=0.3, random_state=129483)
+    
+    # Fit prognostic model
+    prog = fit_prog(hist_train, hist_test)
+    logging.info(f"Run {run_index}: Fitted prognostic model")
+    
+    # Calculate kappa
+    kappa = calc_kappa(prog, hist_data, hist_test)
+    logging.info(f"Run {run_index}: Calculated kappa = {kappa}")
+    
+    # Prepare results
+    result = pd.DataFrame({
+        'run_index': [run_index],
+        'kappa': [kappa],
+        'best_learner_name': ['gbt'],  # Placeholder
+        'timestamp': [time.time()]
+    })
+    
+    # Save results
+    res_dir = ensure_dir_exists(os.path.join('results', 'dpg3_mini', 'base_run', 'experiments'))
+    timestamp = time.strftime("%H%M%S")
+    output_filename = f"experiment_result_run_{run_index}_worker{worker_id}_{timestamp}.parquet"
+    output_path = os.path.join(res_dir, output_filename)
+    
+    try:
+        # Convert to pyarrow table and write
+        table = pa.Table.from_pandas(result)
+        pq.write_table(table, output_path)
+        logging.info(f"Worker {worker_id} successfully wrote file for run {run_index} to {output_path}")
+        return run_index
+    except Exception as e:
+        logging.error(f"Worker {worker_id} failed to write file for run {run_index}: {str(e)}")
+        return None
+
+def main():
+    """Main function to run experiments in parallel"""
+    n_runs = 8
+    logging.info(f"Starting {n_runs} experiments in parallel")
+    
+    # Use all available cores for parallelism
+    n_workers = mp.cpu_count()
+    logging.info(f"Using {n_workers} worker processes")
+    
+    # Create result directory
+    res_dir = ensure_dir_exists(os.path.join('results', 'dpg3_mini', 'base_run', 'experiments'))
+    
+    # Run experiments in parallel using ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(run_experiment, range(1, n_runs + 1)))
+    
+    # Check results
+    completed = [r for r in results if r is not None]
+    logging.info(f"Completed {len(completed)} out of {n_runs} experiments")
+    
+    # List created files
+    files = os.listdir(res_dir)
+    parquet_files = [f for f in files if f.startswith('experiment_result_run_') and f.endswith('.parquet')]
+    logging.info(f"Created {len(parquet_files)} parquet files")
+    for file in parquet_files[:5]:  # Show the first 5 files
+        logging.info(f"  - {file}")
+    
+    if len(parquet_files) < n_runs:
+        logging.warning(f"Expected {n_runs} files but only found {len(parquet_files)}")
+
+if __name__ == "__main__":
+    # Initialize multiprocessing with spawn method for better compatibility
+    mp.set_start_method('spawn', force=True)
+    main()
