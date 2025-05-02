@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# ---------------------------------------------------------------
-# Re-implementation of the R simulation driver in pure Python
-# ---------------------------------------------------------------
+# -----------------------------------------------------------------
+# Re-implementation of the R Monte-Carlo driver – Python 3.6 safe
+# -----------------------------------------------------------------
 
 import os
 import multiprocessing as mp
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
-from typing import Dict, Any, Tuple, List
-
+from typing import Dict, Any, Tuple, List, Optional  # <-- NEW
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -26,73 +25,64 @@ from xgboost import XGBRegressor
 # 0 -- GLOBAL CONFIG
 # ===============================================================
 DGP_STRING      = "dgp3"
-N_HIST          = 2_000         # size of historical data set
-Y_NOISE         = 6             # outcome noise st.dev
-CV_FOLDS        = 10            # inner CV for learner selection
-PARAM_GRID      = {"n_trials": range(100, 501, 50)}   # 100,150,…,500
-N_RUNS          = 200           # Monte-Carlo repetitions
-N_WORKERS       = min(mp.cpu_count(), 32)             # pool size cap
-USE_GPU         = True          # flip to False to force CPU learners
-BASE_SEED       = 129483        # master PRNG seed
-EXPERIMENT_SEED = 3021377       # fixed seed inside each run (like R)
+N_HIST          = 2_000
+Y_NOISE         = 6
+CV_FOLDS        = 10
+PARAM_GRID      = {"n_trials": range(100, 501, 50)}
+N_RUNS          = 200
+N_WORKERS       = min(mp.cpu_count(), 32)
+USE_GPU         = True
+BASE_SEED       = 129483
+EXPERIMENT_SEED = 3021377
 
 BASE_DIR        = Path("results") / DGP_STRING / "base_run"
 EXP_DIR         = BASE_DIR / "experiments"
 EXP_DIR.mkdir(parents=True, exist_ok=True)
 
-# For reproducibility create one RNG instance for the main process
-MAIN_RNG = np.random.default_rng(BASE_SEED)
+MAIN_RNG = np.random.RandomState(BASE_SEED)       # Py 3.6 doesn’t have Generator
 
 # ===============================================================
-# 1 -- DATA-GENERATING PROCESS (dgp)
+# 1 -- DATA-GENERATING PROCESS
 # ===============================================================
-def dgp(n: int,
-        noise: float = 1.0,
-        version: str = "dgp1",
-        rng: np.random.Generator | None = None) -> pd.DataFrame:
-    """Return a DataFrame with covariates W1…W5 and outcome Y."""
+def dgp(n, noise=1.0, version="dgp1", rng=None):  # type: (int, float, str, Optional[np.random.RandomState]) -> pd.DataFrame
     if rng is None:
         rng = MAIN_RNG
-    W = rng.uniform(-1, 1, size=(n, 5))    # 5 features
+    W = rng.uniform(-1, 1, size=(n, 5))
     if version == "dgp3":
-        signal = (W[:, 0] ** 2
-                  + 2.4 * W[:, 2]
-                  + W[:, 4]
-                  - np.sqrt(np.abs(W[:, 0])))
+        signal = (W[:, 0] ** 2 +
+                  2.4 * W[:, 2] +
+                  W[:, 4] -
+                  np.sqrt(np.abs(W[:, 0])))
     elif version == "heterogeneous":
         signal = np.sin(np.abs(W[:, 0]) * np.pi / 10) ** 2
-    else:   # 'constant' or default
+    else:
         signal = np.sin(np.abs(W[:, 0]) * np.pi / 10)
 
     Y = signal + rng.normal(scale=noise, size=n)
 
-    df = pd.DataFrame(W, columns=[f"W{i+1}" for i in range(5)])
+    df = pd.DataFrame(W, columns=["W1", "W2", "W3", "W4", "W5"])
     df.insert(0, "Y", Y)
     return df
 
 # ===============================================================
-# 2 -- GENERATE HISTORICAL DATA  +  TRAIN/TEST SPLIT
+# 2 -- HISTORICAL DATA
 # ===============================================================
-def get_hist_data(n_hist: int,
-                  noise: float,
-                  dgp_string: str,
-                  rng: np.random.Generator) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def get_hist_data(n_hist, noise, dgp_string, rng):  # type: (int, float, str, np.random.RandomState) -> Tuple[pd.DataFrame, pd.DataFrame]
     df = dgp(n_hist, noise, dgp_string, rng)
-    train = df.sample(frac=0.7, random_state=rng.integers(1e9))
-    test  = df.drop(train.index)
+    train = df.sample(frac=0.7, random_state=rng.randint(1e9))
+    test = df.drop(train.index)
     return train.reset_index(drop=True), test.reset_index(drop=True)
 
 # ===============================================================
 # 3 -- CANDIDATE LEARNERS  +  PROGNOSTIC SUPER-LEARNER
 # ===============================================================
-def candidate_learners() -> Dict[str, Any]:
-    """Return dict name → instantiated sklearn/xgboost estimator."""
+def candidate_learners():  # type: () -> Dict[str, Any]
     models = {
-        "lasso" : Lasso(alpha=0.01, max_iter=20_000),
-        "enet"  : ElasticNet(alpha=0.01, l1_ratio=0.3, max_iter=20_000),
-        "rf"    : RandomForestRegressor(n_estimators=400,
-                                        min_samples_leaf=5,
-                                        n_jobs=-1)
+        "lasso": Lasso(alpha=0.01, max_iter=20_000),
+        "enet":  ElasticNet(alpha=0.01, l1_ratio=0.3, max_iter=20_000),
+        "rf":    RandomForestRegressor(n_estimators=400,
+                                       min_samples_leaf=5,
+                                       n_jobs=-1)
     }
     if USE_GPU:
         models["xgb_gpu"] = XGBRegressor(
@@ -101,8 +91,7 @@ def candidate_learners() -> Dict[str, Any]:
             max_depth=6,
             subsample=0.8,
             colsample_bytree=0.8,
-            tree_method="gpu_hist",
-            device="cuda"
+            tree_method="gpu_hist"
         )
     else:
         models["xgb"] = XGBRegressor(
@@ -117,12 +106,7 @@ def candidate_learners() -> Dict[str, Any]:
     return models
 
 
-def fit_prog(train_df: pd.DataFrame,
-             v: int = CV_FOLDS,
-             learners: Dict[str, Any] | None = None,
-             rng: np.random.Generator | None = None
-             ) -> Tuple[str, Any, float]:
-    """Choose the best learner via CV-RMSE and refit on full train set."""
+def fit_prog(train_df, v=CV_FOLDS, learners=None, rng=None):  # type: (pd.DataFrame, int, Optional[Dict[str, Any]], Optional[np.random.RandomState]) -> Tuple[str, Any, float]
     if learners is None:
         learners = candidate_learners()
     if rng is None:
@@ -130,53 +114,39 @@ def fit_prog(train_df: pd.DataFrame,
 
     X = train_df.filter(like="W")
     y = train_df["Y"]
-    cv = KFold(n_splits=v, shuffle=True, random_state=rng.integers(1e9))
+    cv = KFold(n_splits=v, shuffle=True, random_state=rng.randint(1e9))
 
-    rmse_scores: Dict[str, float] = {}
+    rmse_scores = {}  # type: Dict[str, float]
     for name, model in learners.items():
-        neg_rmse = cross_val_score(
-            model, X, y,
-            scoring="neg_root_mean_squared_error",
-            cv=cv,
-            n_jobs=1          # keep inner CV single-threaded
-        )
+        neg_rmse = cross_val_score(model, X, y,
+                                   scoring="neg_root_mean_squared_error",
+                                   cv=cv,
+                                   n_jobs=1)
         rmse_scores[name] = -neg_rmse.mean()
 
     best_name = min(rmse_scores, key=rmse_scores.get)
     best_model = learners[best_name].fit(X, y)
-
-    return best_name, best_model, rmse_scores[best_name]   # return CV-RMSE too
+    return best_name, best_model, rmse_scores[best_name]
 
 # ===============================================================
-# 4 -- BASELINE HISTORICAL MODEL (“prog3”), kappa3, sig3
+# 4 -- BASELINE PROG MODEL
 # ===============================================================
-hist_train, hist_test = get_hist_data(N_HIST, Y_NOISE,
-                                      DGP_STRING, MAIN_RNG)
+hist_train, hist_test = get_hist_data(N_HIST, Y_NOISE, DGP_STRING, MAIN_RNG)
 best_learner_name, prog_model, kappa3 = fit_prog(hist_train)
 
 sig3 = np.std(np.concatenate([hist_train["Y"].values,
                               hist_test["Y"].values]),
               ddof=1)
 
-print(f"[BASELINE] best learner = {best_learner_name}"
-      f" | kappa3 (RMSE) = {kappa3:0.4f}"
-      f" | sig3 = {sig3:0.4f}")
+print("[BASELINE] best learner = {} | kappa3 = {:.4f} | sig3 = {:.4f}"
+      .format(best_learner_name, kappa3, sig3))
 
-# Keep predictor column list handy
 W_COLS = [c for c in hist_train.columns if c.startswith("W")]
 
 # ===============================================================
-# 5 -- EXPERIMENT FUNCTION  (mimics experiment.R)
+# 5 -- EXPERIMENT
 # ===============================================================
-def experiment(n_trials: int,
-               prog_model,
-               noise: float,
-               dgp_string: str,
-               rng: np.random.Generator) -> Dict[str, float | int]:
-    """
-    Generate a fresh trial sample, apply prognostic model,
-    compute operating characteristics.
-    """
+def experiment(n_trials, prog_model, noise, dgp_string, rng):  # type: (int, Any, float, str, np.random.RandomState) -> Dict[str, float]
     df = dgp(n_trials, noise, dgp_string, rng)
     y_true = df["Y"].values
     y_pred = prog_model.predict(df[W_COLS])
@@ -190,35 +160,26 @@ def experiment(n_trials: int,
             "bias": bias,
             "var_pred": var_pred}
 
-# ===============================================================
-# 6 -- RUN ONE MONTE-CARLO REPLICATION  (≃ run_experiment in R)
-# ===============================================================
-param_rows: List[Dict[str, int]] = [
-    {"n_trials": n} for n in PARAM_GRID["n_trials"]
-]
+param_rows = [{"n_trials": n} for n in PARAM_GRID["n_trials"]]
 
-def run_experiment(run_idx: int) -> str:
-    """
-    • Uses fixed historical prognostic model (prog_model)
-    • Loops over PARAM_GRID rows
-    • Writes one Parquet shard
-    Returns the filename for progress reporting.
-    """
-    # worker-local RNG stream
-    rng = np.random.default_rng(EXPERIMENT_SEED + run_idx)
+# ===============================================================
+# 6 -- RUN ONE MONTE-CARLO REPLICATION
+# ===============================================================
+def run_experiment(run_idx):  # type: (int) -> str
+    rng = np.random.RandomState(EXPERIMENT_SEED + run_idx)
 
-    rows = []
+    rows = []  # type: List[Dict[str, Any]]
     for params in param_rows:
-        res = experiment(**params,
-                         prog_model=prog_model,
+        res = experiment(prog_model=prog_model,
                          noise=Y_NOISE,
                          dgp_string=DGP_STRING,
-                         rng=rng)
+                         rng=rng,
+                         **params)
         res["run"] = run_idx
         rows.append(res)
 
     shard = pd.DataFrame(rows)
-    out_path = EXP_DIR / f"experiment_result_run_{run_idx}.parquet"
+    out_path = EXP_DIR / "experiment_result_run_{}.parquet".format(run_idx)
     pq.write_table(pa.Table.from_pandas(shard), out_path)
 
     return out_path.name
@@ -227,15 +188,15 @@ def run_experiment(run_idx: int) -> str:
 # 7 -- PARALLEL EXECUTION
 # ===============================================================
 def main():
-    print(f"[INFO] Launching {N_RUNS} runs on {N_WORKERS} workers …")
+    print("[INFO] Launching {} runs on {} workers …"
+          .format(N_RUNS, N_WORKERS))
     with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
-        futures = [pool.submit(run_experiment, idx)
-                   for idx in range(1, N_RUNS + 1)]
-        for _ in tqdm(as_completed(futures), total=N_RUNS):
+        futs = [pool.submit(run_experiment, idx)
+                for idx in range(1, N_RUNS + 1)]
+        for _ in tqdm(as_completed(futs), total=N_RUNS):
             pass
-    print("[INFO] All Monte-Carlo runs finished ✔")
+    print("[INFO] All runs finished ✔")
 
-    # Write metadata identical to R
     meta = pd.DataFrame(dict(best_learner_name=[best_learner_name],
                              kappa3=[kappa3],
                              sig3=[sig3]))
