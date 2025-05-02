@@ -1,392 +1,248 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------
+# Re-implementation of the R simulation driver in pure Python
+# ---------------------------------------------------------------
+
 import os
-import time
+import multiprocessing as mp
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import product
+from typing import Dict, Any, Tuple, List
+
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import pyarrow as pa
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.model_selection import train_test_split
-from concurrent.futures import ProcessPoolExecutor
-import logging
-from itertools import product
-import uuid
+import pyarrow.parquet as pq
+from tqdm.auto import tqdm
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(processName)s - %(message)s',
-    handlers=[
-        logging.FileHandler("experiment.log"),
-        logging.StreamHandler()
-    ]
-)
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import Lasso, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
 
-# Utility functions
-def ensure_dir_exists(dir_path):
-    """Create directory if it doesn't exist"""
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path, exist_ok=True)
-        logging.info(f"Making {dir_path}")
-    else:
-        logging.info(f"Dir path {dir_path} already present")
-    return dir_path
+# ===============================================================
+# 0 -- GLOBAL CONFIG
+# ===============================================================
+DGP_STRING      = "dgp3"
+N_HIST          = 2_000         # size of historical data set
+Y_NOISE         = 6             # outcome noise st.dev
+CV_FOLDS        = 10            # inner CV for learner selection
+PARAM_GRID      = {"n_trials": range(100, 501, 50)}   # 100,150,…,500
+N_RUNS          = 200           # Monte-Carlo repetitions
+N_WORKERS       = min(mp.cpu_count(), 32)             # pool size cap
+USE_GPU         = True          # flip to False to force CPU learners
+BASE_SEED       = 129483        # master PRNG seed
+EXPERIMENT_SEED = 3021377       # fixed seed inside each run (like R)
 
-# Data generation functions
-def set_dgp(dgp_string='constant'):
-    """Set the data generating process based on dgp_string"""
-    def mu0_constant(X):
-        return np.sin(np.abs(X[:, 0])*np.pi/10) - 3
-    
-    def mu1_constant(X):
-        return np.sin(np.abs(X[:, 0])*np.pi/10)
-    
-    def mu0_heterogeneous(X):
-        return np.sin(np.abs(X[:, 0])*np.pi/10)**2 - 30.00103
-    
-    def mu1_heterogeneous(X):
-        return np.sin(np.abs(X[:, 0])*np.pi/10)
-    
-    def mu0_dgp3(X):
-        return X[:, 0]**2 + 2.4 * X[:, 2] + X[:, 4] - np.sqrt(np.abs(X[:, 0]))
-    
-    def mu1_dgp3(X):
-        return X[:, 0]**2 + 2*X[:, 1] - 0.2 * X[:, 2] + X[:, 4] - np.sqrt(np.abs(X[:, 0]))
-    
-    dgp_functions = {
-        'constant': (mu0_constant, mu1_constant),
-        'heterogeneous': (mu0_heterogeneous, mu1_heterogeneous),
-        'dgp3': (mu0_dgp3, mu1_dgp3)
+BASE_DIR        = Path("results") / DGP_STRING / "base_run"
+EXP_DIR         = BASE_DIR / "experiments"
+EXP_DIR.mkdir(parents=True, exist_ok=True)
+
+# For reproducibility create one RNG instance for the main process
+MAIN_RNG = np.random.default_rng(BASE_SEED)
+
+# ===============================================================
+# 1 -- DATA-GENERATING PROCESS (dgp)
+# ===============================================================
+def dgp(n: int,
+        noise: float = 1.0,
+        version: str = "dgp1",
+        rng: np.random.Generator | None = None) -> pd.DataFrame:
+    """Return a DataFrame with covariates W1…W5 and outcome Y."""
+    if rng is None:
+        rng = MAIN_RNG
+    W = rng.uniform(-1, 1, size=(n, 5))    # 5 features
+    if version == "dgp3":
+        signal = (W[:, 0] ** 2
+                  + 2.4 * W[:, 2]
+                  + W[:, 4]
+                  - np.sqrt(np.abs(W[:, 0])))
+    elif version == "heterogeneous":
+        signal = np.sin(np.abs(W[:, 0]) * np.pi / 10) ** 2
+    else:   # 'constant' or default
+        signal = np.sin(np.abs(W[:, 0]) * np.pi / 10)
+
+    Y = signal + rng.normal(scale=noise, size=n)
+
+    df = pd.DataFrame(W, columns=[f"W{i+1}" for i in range(5)])
+    df.insert(0, "Y", Y)
+    return df
+
+# ===============================================================
+# 2 -- GENERATE HISTORICAL DATA  +  TRAIN/TEST SPLIT
+# ===============================================================
+def get_hist_data(n_hist: int,
+                  noise: float,
+                  dgp_string: str,
+                  rng: np.random.Generator) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = dgp(n_hist, noise, dgp_string, rng)
+    train = df.sample(frac=0.7, random_state=rng.integers(1e9))
+    test  = df.drop(train.index)
+    return train.reset_index(drop=True), test.reset_index(drop=True)
+
+# ===============================================================
+# 3 -- CANDIDATE LEARNERS  +  PROGNOSTIC SUPER-LEARNER
+# ===============================================================
+def candidate_learners() -> Dict[str, Any]:
+    """Return dict name → instantiated sklearn/xgboost estimator."""
+    models = {
+        "lasso" : Lasso(alpha=0.01, max_iter=20_000),
+        "enet"  : ElasticNet(alpha=0.01, l1_ratio=0.3, max_iter=20_000),
+        "rf"    : RandomForestRegressor(n_estimators=400,
+                                        min_samples_leaf=5,
+                                        n_jobs=-1)
     }
-    
-    return dgp_functions.get(dgp_string, dgp_functions['dgp3'])
+    if USE_GPU:
+        models["xgb_gpu"] = XGBRegressor(
+            n_estimators=800,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method="gpu_hist",
+            device="cuda"
+        )
+    else:
+        models["xgb"] = XGBRegressor(
+            n_estimators=800,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            n_jobs=-1,
+            tree_method="hist"
+        )
+    return models
 
-def dgp(n, y_noise=0):
-    """Generate data with specified noise level"""
-    # Bounds for the features
-    W1_bound, W1_ubound = -1, 1
-    W2_bound, W2_ubound = -1, 1
-    W3_bound, W3_ubound = -1, 1
-    W4_bound, W4_ubound = -1, 1
-    W5_bound, W5_ubound = -1, 1
-    
-    # Generate features
-    W1 = np.random.uniform(W1_bound, W1_ubound, n)
-    W2 = np.random.uniform(W2_bound, W2_ubound, n)
-    W3 = np.random.uniform(W3_bound, W3_ubound, n)
-    W4 = np.random.uniform(W4_bound, W4_ubound, n)
-    W5 = np.random.uniform(W5_bound, W5_ubound, n)
-    
-    # Create a dataframe
-    data = pd.DataFrame({
-        'W1': W1, 'W2': W2, 'W3': W3, 'W4': W4, 'W5': W5
-    })
-    
-    # Return the dataframe
-    return data
 
-def get_hist_dat(n_hist=1000, y_noise=6, dgp_string="dgp1"):
-    """Generate historical data similar to the R get_hist_dat function"""
-    # Set the data generating process
-    mu0_func, mu1_func = set_dgp(dgp_string)
-    
-    # Generate data
-    data_hist = dgp(n=n_hist)
-    
-    # Generate treatment indicator
-    A = np.random.binomial(1, 0.5, n_hist)
-    data_hist['A'] = A
-    
-    # Features as numpy array for mu functions
-    X = data_hist[['W1', 'W2', 'W3', 'W4', 'W5']].values
-    
-    # Generate outcomes based on treatment
-    mu0 = mu0_func(X)
-    mu1 = mu1_func(X)
-    
-    # Add noise
-    Y0 = mu0 + np.random.normal(0, y_noise, n_hist)
-    Y1 = mu1 + np.random.normal(0, y_noise, n_hist)
-    
-    # Observed outcome
-    Y = A * Y1 + (1 - A) * Y0
-    
-    # Add to dataframe
-    data_hist['Y'] = Y
-    data_hist['Y0'] = Y0
-    data_hist['Y1'] = Y1
-    
-    # Select columns that start with W for prediction
-    W_cols = [col for col in data_hist.columns if col.startswith('W')]
-    
-    # Initial split of data (equivalent to R's initial_split)
-    train_idx = np.random.choice(n_hist, int(0.7 * n_hist), replace=False)
-    test_idx = np.array([i for i in range(n_hist) if i not in train_idx])
-    
-    hist_train = data_hist.iloc[train_idx].reset_index(drop=True)
-    hist_test = data_hist.iloc[test_idx].reset_index(drop=True)
-    
-    return hist_train, hist_test
-
-def unadjusted_estimator(data):
-    """Unadjusted estimator similar to the R code"""
-    y1_mean = data[data['A'] == 1]['Y'].mean()
-    y0_mean = data[data['A'] == 0]['Y'].mean()
-    effect = y1_mean - y0_mean
-    
-    # Calculate SE
-    y1_var = data[data['A'] == 1]['Y'].var()
-    y0_var = data[data['A'] == 0]['Y'].var()
-    n1 = (data['A'] == 1).sum()
-    n0 = (data['A'] == 0).sum()
-    se = np.sqrt(y1_var/n1 + y0_var/n0)
-    
-    return {'effect': effect, 'se': se}
-
-def linear_estimator(data):
-    """Linear regression estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
-    y = data['Y']
-    
-    # Fit model
-    model = LinearRegression()
-    model.fit(X, y)
-    
-    # Create datasets for counterfactual prediction
-    X1 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X1['A'] = 1
-    X0 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X0['A'] = 0
-    
-    # Predict counterfactuals
-    y1_pred = model.predict(X1)
-    y0_pred = model.predict(X0)
-    
-    # Calculate effect
-    effect = (y1_pred - y0_pred).mean()
-    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
-    
-    return {'effect': effect, 'se': se}
-
-def gbt_estimator(data):
-    """Gradient Boosted Trees estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
-    y = data['Y']
-    
-    # Fit model
-    model = GradientBoostingRegressor(
-        n_estimators=100, 
-        max_depth=3,
-        learning_rate=0.1
-    )
-    model.fit(X, y)
-    
-    # Create datasets for counterfactual prediction
-    X1 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X1['A'] = 1
-    X0 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X0['A'] = 0
-    
-    # Predict counterfactuals
-    y1_pred = model.predict(X1)
-    y0_pred = model.predict(X0)
-    
-    # Calculate effect
-    effect = (y1_pred - y0_pred).mean()
-    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
-    
-    return {'effect': effect, 'se': se}
-
-def knn_estimator(data):
-    """K-Nearest Neighbors estimator"""
-    X = data[['W1', 'W2', 'W3', 'W4', 'W5', 'A']]
-    y = data['Y']
-    
-    # Fit model
-    model = KNeighborsRegressor(n_neighbors=5)
-    model.fit(X, y)
-    
-    # Create datasets for counterfactual prediction
-    X1 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X1['A'] = 1
-    X0 = data[['W1', 'W2', 'W3', 'W4', 'W5']].copy()
-    X0['A'] = 0
-    
-    # Predict counterfactuals
-    y1_pred = model.predict(X1)
-    y0_pred = model.predict(X0)
-    
-    # Calculate effect
-    effect = (y1_pred - y0_pred).mean()
-    se = np.std(y1_pred - y0_pred) / np.sqrt(len(y))
-    
-    return {'effect': effect, 'se': se}
-
-def fit_prog(train_dat, V=10, learners=None):
-    """Fit prognostic models - equivalent to the R fit_prog function"""
+def fit_prog(train_df: pd.DataFrame,
+             v: int = CV_FOLDS,
+             learners: Dict[str, Any] | None = None,
+             rng: np.random.Generator | None = None
+             ) -> Tuple[str, Any, float]:
+    """Choose the best learner via CV-RMSE and refit on full train set."""
     if learners is None:
-        learners = {
-            'linear': linear_estimator,
-            'gbt': gbt_estimator,
-            'knn': knn_estimator
-        }
-    
-    # 5-fold cross-validation
-    n = len(train_dat)
-    fold_ids = np.random.randint(0, 5, n)
-    
-    results = {}
-    for name, learner in learners.items():
-        try:
-            # Train and validate
-            result = learner(train_dat)
-            results[name] = result
-        except Exception as e:
-            logging.error(f"Error in learner {name}: {str(e)}")
-    
-    # Select best learner
-    if results:
-        best_learner_name = min(results, key=lambda k: results[k]['se'])
-        return learners[best_learner_name]
-    else:
-        # Fallback
-        return linear_estimator
+        learners = candidate_learners()
+    if rng is None:
+        rng = MAIN_RNG
 
-def calc_kappa(prog_mod, test_dat):
-    """Calculate kappa metric - equivalent to the R calc_kappa function"""
-    # Apply prognostic model
-    est_Y = prog_mod(test_dat)
-    
-    # Extract predictions starting with W (this is what the R code does)
-    pred = est_Y['effect']
-    
-    # Calculate RMSE
-    rmse = np.sqrt(np.mean((est_Y['effect'] - test_dat['Y']) ** 2))
-    
-    return rmse
+    X = train_df.filter(like="W")
+    y = train_df["Y"]
+    cv = KFold(n_splits=v, shuffle=True, random_state=rng.integers(1e9))
 
-def sd(values):
-    """Calculate standard deviation like in R"""
-    return np.std(values, ddof=1)
+    rmse_scores: Dict[str, float] = {}
+    for name, model in learners.items():
+        neg_rmse = cross_val_score(
+            model, X, y,
+            scoring="neg_root_mean_squared_error",
+            cv=cv,
+            n_jobs=1          # keep inner CV single-threaded
+        )
+        rmse_scores[name] = -neg_rmse.mean()
 
-def expand_grid(param_dict):
-    """Create a DataFrame with all combinations of parameters"""
-    return pd.DataFrame([row for row in product(*param_dict.values())], 
-                        columns=param_dict.keys())
+    best_name = min(rmse_scores, key=rmse_scores.get)
+    best_model = learners[best_name].fit(X, y)
 
-def run_experiment(run_index):
-    """Run a single experiment - equivalent to the R run_experiment function"""
-    worker_id = os.getpid()
-    logging.info(f"Worker {worker_id} starting run {run_index}")
-    
-    # Set random seed for reproducibility
-    np.random.seed(129483)
-    
-    # Create parameter dictionary like in R
-    params = {'n_trials': [100, 200, 300, 400, 500]}
-    
-    # For this specific run, we'll use a fixed set of parameters
-    param_set = {
-        'hist_lrnr': 'prog3',  # Assuming prog3 is a variable in R
-        'y_noise': 6,
-        'dgp_string': 'dgp3',
-        'V': 20
-    }
-    
-    try:
-        # Generate historical data
-        hist_train, hist_test = get_hist_dat(n_hist=2000, y_noise=6, dgp_string="dgp3")
-        
-        # Fit prognostic model
-        prog = fit_prog(hist_train)
-        
-        # Calculate kappa
-        kappa = calc_kappa(prog, hist_test)
-        
-        # Calculate sig3 (standard deviation)
-        sig3 = sd(hist_train[hist_train['A'] == 1]['Y'] - hist_train[hist_train['A'] == 0]['Y'])
-        
-        # Set the experimental seed
-        experimental_seed = 3021377
-        np.random.seed(experimental_seed)
-        
-        # Prepare results
-        result = pd.DataFrame({
-            'run_index': [run_index],
-            'hist_lrnr': [param_set['hist_lrnr']],
-            'y_noise': [param_set['y_noise']],
-            'dgp_string': [param_set['dgp_string']],
-            'V': [param_set['V']],
-            'kappa': [kappa],
-            'sig3': [sig3],
-            'seed': [experimental_seed]
-        })
-        
-        # Create output path just like in the R code
-        res_dir = os.path.join('results', 'dgp3', 'base_run', 'experiments')
-        ensure_dir_exists(res_dir)
-        
-        # Create output filename exactly as in R code
-        output_filename = f"experiment_result_run_{run_index}.parquet"
-        output_path = os.path.join(res_dir, output_filename)
-        
-        # Write to parquet file
-        table = pa.Table.from_pandas(result)
-        pq.write_table(table, output_path)
-        
-        logging.info(f"Worker {worker_id} completed run {run_index}")
-        return run_index
-        
-    except Exception as e:
-        logging.error(f"Worker {worker_id} error in run {run_index}: {str(e)}", exc_info=True)
-        return None
+    return best_name, best_model, rmse_scores[best_name]   # return CV-RMSE too
 
+# ===============================================================
+# 4 -- BASELINE HISTORICAL MODEL (“prog3”), kappa3, sig3
+# ===============================================================
+hist_train, hist_test = get_hist_data(N_HIST, Y_NOISE,
+                                      DGP_STRING, MAIN_RNG)
+best_learner_name, prog_model, kappa3 = fit_prog(hist_train)
+
+sig3 = np.std(np.concatenate([hist_train["Y"].values,
+                              hist_test["Y"].values]),
+              ddof=1)
+
+print(f"[BASELINE] best learner = {best_learner_name}"
+      f" | kappa3 (RMSE) = {kappa3:0.4f}"
+      f" | sig3 = {sig3:0.4f}")
+
+# Keep predictor column list handy
+W_COLS = [c for c in hist_train.columns if c.startswith("W")]
+
+# ===============================================================
+# 5 -- EXPERIMENT FUNCTION  (mimics experiment.R)
+# ===============================================================
+def experiment(n_trials: int,
+               prog_model,
+               noise: float,
+               dgp_string: str,
+               rng: np.random.Generator) -> Dict[str, float | int]:
+    """
+    Generate a fresh trial sample, apply prognostic model,
+    compute operating characteristics.
+    """
+    df = dgp(n_trials, noise, dgp_string, rng)
+    y_true = df["Y"].values
+    y_pred = prog_model.predict(df[W_COLS])
+
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    bias = (y_pred - y_true).mean()
+    var_pred = y_pred.var()
+
+    return {"n_trials": n_trials,
+            "rmse": rmse,
+            "bias": bias,
+            "var_pred": var_pred}
+
+# ===============================================================
+# 6 -- RUN ONE MONTE-CARLO REPLICATION  (≃ run_experiment in R)
+# ===============================================================
+param_rows: List[Dict[str, int]] = [
+    {"n_trials": n} for n in PARAM_GRID["n_trials"]
+]
+
+def run_experiment(run_idx: int) -> str:
+    """
+    • Uses fixed historical prognostic model (prog_model)
+    • Loops over PARAM_GRID rows
+    • Writes one Parquet shard
+    Returns the filename for progress reporting.
+    """
+    # worker-local RNG stream
+    rng = np.random.default_rng(EXPERIMENT_SEED + run_idx)
+
+    rows = []
+    for params in param_rows:
+        res = experiment(**params,
+                         prog_model=prog_model,
+                         noise=Y_NOISE,
+                         dgp_string=DGP_STRING,
+                         rng=rng)
+        res["run"] = run_idx
+        rows.append(res)
+
+    shard = pd.DataFrame(rows)
+    out_path = EXP_DIR / f"experiment_result_run_{run_idx}.parquet"
+    pq.write_table(pa.Table.from_pandas(shard), out_path)
+
+    return out_path.name
+
+# ===============================================================
+# 7 -- PARALLEL EXECUTION
+# ===============================================================
 def main():
-    """Main function to run experiments in parallel"""
-    # Number of runs (200 as in your updated R code)
-    n_runs = 200
-    logging.info(f"Starting {n_runs} experiments")
-    
-    # Use multiple workers but limit to system capacity
-    n_workers = min(os.cpu_count(), 16)  # Limit to 16 cores max
-    logging.info(f"Using {n_workers} worker processes")
-    
-    # Create results directory
-    res_dir = os.path.join('results', 'dgp3', 'base_run', 'experiments')
-    ensure_dir_exists(res_dir)
-    
-    # Run experiments in parallel
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = [executor.submit(run_experiment, i) for i in range(1, n_runs + 1)]
-        results = []
-        for future in futures:
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                logging.error(f"Error in future: {str(e)}")
-    
-    # Check results
-    completed = [r for r in results if r is not None]
-    logging.info(f"Completed {len(completed)} out of {n_runs} experiments")
-    
-    # Create summary file like in R
-    best_learner_name = "gbt"  # This would be determined from your runs
-    
-    # Create summary dataframe
-    summary_df = pd.DataFrame({
-        'best_learner_name': [best_learner_name],
-        'kappa3': [0.85],  # Example value
-        'sig3': [0.76]     # Example value
-    })
-    
-    # Write summary file
-    summary_path = os.path.join('results', 'dgp3', 'base_run', 'base_run_dgp3.parquet')
-    summary_table = pa.Table.from_pandas(summary_df)
-    pq.write_table(summary_table, summary_path)
-    
-    logging.info("Finished experiments")
+    print(f"[INFO] Launching {N_RUNS} runs on {N_WORKERS} workers …")
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
+        futures = [pool.submit(run_experiment, idx)
+                   for idx in range(1, N_RUNS + 1)]
+        for _ in tqdm(as_completed(futures), total=N_RUNS):
+            pass
+    print("[INFO] All Monte-Carlo runs finished ✔")
+
+    # Write metadata identical to R
+    meta = pd.DataFrame(dict(best_learner_name=[best_learner_name],
+                             kappa3=[kappa3],
+                             sig3=[sig3]))
+    pq.write_table(pa.Table.from_pandas(meta),
+                   BASE_DIR / "base_run_dgp3.parquet")
+    print("[INFO] Metadata written →", BASE_DIR / "base_run_dgp3.parquet")
+
 
 if __name__ == "__main__":
     main()
