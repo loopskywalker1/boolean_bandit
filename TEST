@@ -1,41 +1,651 @@
-if outputFileType == "infer":
-    outputFileType = 'json' if has_nested_data(df) else 'tsv'
+#!/usr/bin/env python3
+# ########################################################
+# ########################################################
 
-if mode == "display":
-    print(response_data)
-elif mode == "j-drive":
-    f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
-else:
-    f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
+# Libraries
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+import pendulum
+import itertools
 
-if outputFileType == 'json':
-    # Change from df.write_ndjson() to df.write_json() for proper JSON format
-    content = df.write_json()  # This should be df.write_json(), not ndjson
-    f.write(content)
+# Airflow
+from airflow.models import DAG, Variable
+from airflow.utils.dates import days_ago
+from airflow.hooks.base import BaseHook
+from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+from airflow.operators.empty import EmptyOperator
+
+# Kubernetes
+from kubernetes.client import models as k8s
+
+# Airflow parameters
+from airflow.models.param import Param
+from airflow.decorators import dag, task
+
+# ########################################################
+# DAG settings
+# ########################################################
+
+LOCAL_TZ = pendulum.timezone("America/Los_Angeles")
+
+DAG_NAME = "s3_to_jdrive_push"  # DAG name (proposed format: lowercase underscore). Should be unique.
+DAG_DESCRIPTION = "Daily push of data from S3 to J-Drive for data sharing"
+DAG_START_DATE = datetime(2024, 6, 15, tzinfo=LOCAL_TZ)  # Start date. When setting the "catchup" parameter to True, you can perform a backfill when you upload
+DAG_SCHEDULE_INTERVAL = "@daily"  # Cron notation -> see https://airflow.apache.org/scheduler.html#dag-runs
+DAG_CATCHUP = False  # When set to true, DAG will start running from DAG_START_DATE instead of current date
+DAG_PAUSED_UPON_CREATION = True  # Defaults to False. When set to True, uploading a DAG for the first time, the DAG doesn't start directly
+DAG_MAX_ACTIVE_RUNS = 5  # Configure efficiency: Max. number of active runs for this DAG. Scheduler will not create new DAG runs once this limit has been hit
+
+emails = []
+
+# ########################################################
+# Default DAG arguments
+# ########################################################
+
+default_args = {
+    "owner": "airflow",
+    "start_date": DAG_START_DATE,
+    "depends_on_past": False,
+    "email": emails,
+    "email_on_failure": True,
+    "email_on_retry": False,
+    "retries": 5,  # Max. number of retries before failing
+    "retry_delay": timedelta(minutes=2)  # Retry delay
+}
+
+# ########################################################
+# DAG configuration (custom)
+# ########################################################
+
+SOME_CUSTOM_CONFIG = "yes"
+
+# ########################################################
+# Main DAG
+# ########################################################
+
+# Define volume to mount for J-Drive access
+pod_volumes = [
+    k8s.V1Volume(
+        name="src",
+        host_path=k8s.V1HostPathVolumeSource(path="/mapposix/df.dords.kaiser.org/groups/clinical-trials/clinical_trials_datalake/"),
+    ),
+]
+
+# Define volume mounts for the container
+pod_volume_mounts = [
+    k8s.V1VolumeMount(
+        name="src",
+        mount_path="/src",
+        sub_path=None,
+        read_only=False
+    ),
+]
+
+@dag(dag_id=DAG_NAME, schedule=DAG_SCHEDULE_INTERVAL, tags=['clinical_trials'], catchup=False, start_date=DAG_START_DATE)
+def taskflow():
+    # Define the S3 to J-Drive push task
+    s3_jdrive_push = KubernetesPodOperator(
+        task_id="s3_jdrive_push_pod",
+        image = "iregistry.dords.kaiser.org/s3-jdrive-pod:0.1",
+        namespace="batch",
+        do_xcom_push=False,
+        volumes=pod_volumes,
+        volume_mounts=pod_volume_mounts,
+        container_resources=k8s.V1ResourceRequirements(
+            requests={"cpu": "2", "memory": "4Gi", "ephemeral-storage": "500Mi"},
+            limits={"cpu": "4", "memory": "8Gi", "ephemeral-storage": "1Gi"},
+        ),
+        image_pull_policy='IfNotPresent',
+        kubernetes_conn_id="anp-cluster-conn",
+        get_logs=True,
+        deferrable=True,
+        on_finish_action="delete_succeeded_pod",
+        name="s3_jdrive_push_pod",
+        email_on_failure=True,
+        cmds=["python", "/src/run.py"],  # Run python script in pod
+        # Pass arguments to the container script
+        arguments=[
+            "--s3-bucket", "{{ var.value.s3_bucket }}",
+            "--s3-prefix", "{{ var.value.s3_prefix }}",
+            "--jdrive-path", "{{ var.value.jdrive_path }}",
+            "--file-pattern", "{{ var.value.file_pattern or '*.json' }}",
+            "--aws-access-key-id", "{{ var.value.aws_access_key_id }}",
+            "--aws-secret-access-key", "{{ var.value.aws_secret_access_key }}",
+            "--aws-region", "{{ var.value.aws_region or 'us-west-2' }}",
+            "--token-path", "/src/vault.token",
+            "--auth-path", "/src/auths.json"
+        ]
+    )
+
+    start = EmptyOperator(
+        task_id="start")
     
-    # Add this section to create NDJSON file in the ndjson subfolder
-    if mode == "j-drive":
-        ndjson_dir = os.path.join(JDriveResources["Path"], "ndjson")
-        os.makedirs(ndjson_dir, exist_ok=True)
-        ndjson_path = os.path.join(ndjson_dir, f"{endpoint}_Response.ndjson")
-        with open(ndjson_path, "w") as ndjson_file:
-            ndjson_content = df.write_ndjson()
-            ndjson_file.write(ndjson_content)
-    else:
-        ndjson_dir = "query_results/ndjson"
-        os.makedirs(ndjson_dir, exist_ok=True)
-        ndjson_path = os.path.join(ndjson_dir, f"{endpoint}_Response.ndjson")
-        with open(ndjson_path, "w") as ndjson_file:
-            ndjson_content = df.write_ndjson()
-            ndjson_file.write(ndjson_content)
+    complete = EmptyOperator(
+        task_id="complete")
     
-elif outputFileType == 'tsv':
-    content = df.write_csv(separator='\t')
-    f.write(content)
-elif outputFileType == 'avro':
-    df.write_parquet('temp.parquet')
-    # avro writing bug workaround
-    pl.read_parquet("temp.parquet").write_avro(f)
-elif outputFileType == 'parquet':
-    df.write_parquet(f)
-f.close()
+    start >> s3_jdrive_push >> complete
+
+taskflow()
+
+FROM python:3.9-slim
+
+# Install required system dependencies
+RUN apt-get update && apt-get install -y \
+    smbclient \
+    curl \
+    unzip \
+    libkrb5-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install AWS CLI
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip \
+    && ./aws/install \
+    && rm -rf awscliv2.zip aws
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    boto3 \
+    pysmb \
+    hvac \
+    typing_extensions \
+    pendulum
+
+# Create directories
+RUN mkdir -p /src /data
+
+# Copy script
+COPY run.py /src/
+
+# Set working directory
+WORKDIR /src
+
+# Entrypoint
+ENTRYPOINT ["python", "/src/run.py"]
+
+#!/usr/bin/env python3
+"""
+S3 to J-Drive Transfer Script
+
+Pulls data from an S3 bucket and pushes it to a J-Drive location
+using SMB authentication from vault tokens.
+"""
+
+import os
+import sys
+import json
+import argparse
+import logging
+import re
+import glob
+from datetime import datetime
+from typing import List, Optional, TextIO
+
+import boto3
+import hvac
+import smbc  # Using smbc library (part of the pysmb package)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+TOKEN_PATH = "src/vault.token"
+AUTH_PATH = "src/auths.json"
+
+# Configuration variables with default paths
+JDriveResources = {
+    "Server": "",
+    "Share": "",
+    "Path": "",
+    "MountPath": "",
+    "URL": "",
+    "Vault": {
+        "URL": "",
+        "Path": "",
+        "MountPath": ""
+    }
+}
+
+class SMBResourceHandler:
+    def __init__(self, vault_path: str = TOKEN_PATH, auth_path: str = AUTH_PATH):
+        self.vault_path = vault_path
+        self.auth_path = auth_path
+        self.client = None
+        self.smbclient = None
+        self.authenticated = False
+        self.username = ""
+        self.password = ""
+
+        try:
+            # Load the J-Drive resources configuration
+            with open(auth_path, 'r') as f:
+                auth_config = json.load(f)
+                global JDriveResources
+                if "JDrive" in auth_config:
+                    JDriveResources = auth_config["JDrive"]
+                else:
+                    logger.warning("JDrive configuration not found in auth file")
+        except Exception as e:
+            logger.error(f"Error loading auth configuration: {str(e)}")
+            raise
+
+    def authenticate_smb(self):
+        """Configure SMB client to have service account credentials for subsequent operations."""
+        try:
+            with open(self.vault_path, mode="r") as f:
+                vault_token = f.readline().strip()
+            
+            # Initialize the hvac client to connect to Vault
+            self.client = hvac.Client(url=JDriveResources["Vault"]["URL"], token=vault_token)
+            self.client.secrets.kv.default_kv_version = 1
+            
+            # Read secrets from Vault
+            vault_resp = self.client.secrets.kv.read_secret(
+                mount_point=JDriveResources["Vault"]["MountPath"],
+                path=JDriveResources["Vault"]["Path"],
+            )["data"]
+            
+            # Format domain and username
+            self.username = "{0}\\{1}".format(vault_resp["domain"], vault_resp["username"])
+            self.password = vault_resp["password"]
+            
+            # Initialize the SMB client
+            self.smbclient = smbc.Context(auth_fn=self._smbc_auth_callback)
+            self.authenticated = True
+            logger.info("SMB authentication successful")
+            
+        except Exception as e:
+            logger.error(f"SMB authentication failed: {str(e)}")
+            raise ValueError(f"Failed to authenticate SMB: {str(e)}")
+    
+    def _smbc_auth_callback(self, server, share, workgroup, username, password):
+        """Callback function for SMB authentication"""
+        return (self.username, self.password)
+
+    def list_dirs(self, path: str = None, display: bool = True) -> List[str]:
+        """List directories on j-drive."""
+        if not self.authenticated:
+            self.authenticate_smb()
+        
+        path = path or JDriveResources["Path"]
+        smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{path}"
+        
+        try:
+            entries = self.smbclient.opendir(smb_path).getdents()
+            files = [entry.name for entry in entries if entry.name not in ['.', '..']]
+            
+            if display:
+                logger.info(f"Files in {smb_path}: {files}")
+            
+            return files
+        except Exception as e:
+            logger.error(f"Error listing directories: {str(e)}")
+            raise
+    
+    def get_jdrive_file(self, file_path: str = None, mode: str = "r") -> TextIO:
+        """Opens and returns a file from j-drive."""
+        if not self.authenticated:
+            self.authenticate_smb()
+        
+        assert mode in ["r", "w"], "mode must either be w (write) or r (read)"
+        
+        if mode == "r":
+            if file_path is None:
+                raise ValueError("must give path to file for reading")
+            
+            smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{JDriveResources['Path']}/{file_path}"
+            
+            try:
+                return self.smbclient.open(smb_path, os.O_RDONLY)
+            except Exception as e:
+                logger.error(f"Error opening file for reading: {str(e)}")
+                raise
+        else:  # mode == "w"
+            if file_path is None:
+                raise ValueError("must provide either filepath or endpoint for writing")
+            
+            # Create timestamp for the filename
+            timestamp = datetime.now().strftime("%Y-%m-%d-%H")
+            file_path = f"{file_path}_{timestamp}.json"
+            
+            smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{JDriveResources['Path']}/{file_path}"
+            
+            try:
+                return self.smbclient.open(smb_path, os.O_WRONLY | os.O_CREAT)
+            except Exception as e:
+                logger.error(f"Error opening file for writing: {str(e)}")
+                raise
+
+    def write_to_jdrive(self, data: bytes, file_path: str) -> None:
+        """Write data to a file on J-Drive"""
+        if not self.authenticated:
+            self.authenticate_smb()
+        
+        file_handle = self.get_jdrive_file(file_path=file_path, mode="w")
+        try:
+            file_handle.write(data)
+            logger.info(f"Successfully wrote data to {file_path}")
+        except Exception as e:
+            logger.error(f"Error writing to file: {str(e)}")
+            raise
+        finally:
+            file_handle.close()
+
+
+class S3Downloader:
+    def __init__(self, bucket: str, prefix: str, 
+                 aws_access_key_id: Optional[str] = None,
+                 aws_secret_access_key: Optional[str] = None,
+                 aws_region: str = 'us-west-2'):
+        
+        # Initialize S3 client
+        session_kwargs = {'region_name': aws_region}
+        if aws_access_key_id and aws_secret_access_key:
+            session_kwargs['aws_access_key_id'] = aws_access_key_id
+            session_kwargs['aws_secret_access_key'] = aws_secret_access_key
+        
+        self.session = boto3.session.Session(**session_kwargs)
+        self.s3 = self.session.client('s3')
+        self.bucket = bucket
+        self.prefix = prefix
+        
+        logger.info(f"Initialized S3 client for bucket: {bucket}, prefix: {prefix}")
+
+    def list_files(self, file_pattern: str = "*.json") -> List[str]:
+        """List files in the S3 bucket matching the pattern"""
+        pattern_re = re.compile(fnmatch_to_regex(file_pattern))
+        
+        paginator = self.s3.get_paginator('list_objects_v2')
+        files = []
+        
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    # Skip folder objects
+                    if key.endswith('/'):
+                        continue
+                    
+                    # Get just the filename part
+                    filename = os.path.basename(key)
+                    if pattern_re.match(filename):
+                        files.append(key)
+        
+        logger.info(f"Found {len(files)} files matching pattern {file_pattern}")
+        return files
+
+    def download_file(self, key: str) -> bytes:
+        """Download file from S3 and return the content as bytes"""
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=key)
+            content = response['Body'].read()
+            logger.info(f"Downloaded file: {key}, size: {len(content)} bytes")
+            return content
+        except Exception as e:
+            logger.error(f"Error downloading file {key}: {str(e)}")
+            raise
+
+
+def fnmatch_to_regex(pattern: str) -> str:
+    """Convert a shell-style pattern to a regular expression"""
+    pattern = re.escape(pattern)
+    pattern = pattern.replace(r'\*', '.*')
+    pattern = pattern.replace(r'\?', '.')
+    return f'^{pattern}$'
+
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Download from S3 and push to J-Drive')
+    
+    parser.add_argument('--s3-bucket', required=True, help='S3 bucket name')
+    parser.add_argument('--s3-prefix', default='', help='S3 prefix (folder path)')
+    parser.add_argument('--jdrive-path', required=True, help='J-Drive path to save files to')
+    parser.add_argument('--file-pattern', default='*.json', help='File pattern to match (e.g., *.json)')
+    parser.add_argument('--aws-access-key-id', help='AWS access key ID')
+    parser.add_argument('--aws-secret-access-key', help='AWS secret access key')
+    parser.add_argument('--aws-region', default='us-west-2', help='AWS region')
+    parser.add_argument('--token-path', default=TOKEN_PATH, help='Path to vault token')
+    parser.add_argument('--auth-path', default=AUTH_PATH, help='Path to auth configuration')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point for S3 to J-Drive transfer"""
+    args = parse_arguments()
+    
+    # Set logging level
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    try:
+        # Initialize SMB client
+        smb_handler = SMBResourceHandler(vault_path=args.token_path, auth_path=args.auth_path)
+        smb_handler.authenticate_smb()
+        
+        # Initialize S3 client
+        s3_downloader = S3Downloader(
+            bucket=args.s3_bucket,
+            prefix=args.s3_prefix,
+            aws_access_key_id=args.aws_access_key_id,
+            aws_secret_access_key=args.aws_secret_access_key,
+            aws_region=args.aws_region
+        )
+        
+        # List files to transfer
+        s3_files = s3_downloader.list_files(file_pattern=args.file_pattern)
+        
+        if not s3_files:
+            logger.warning(f"No files found matching pattern: {args.file_pattern}")
+            return 0
+        
+        # Process each file
+        success_count = 0
+        for file_key in s3_files:
+            try:
+                # Download from S3
+                file_content = s3_downloader.download_file(file_key)
+                
+                # Get just the filename part
+                filename = os.path.basename(file_key)
+                
+                # Create the destination path
+                dest_path = f"{args.jdrive_path}/{filename}"
+                
+                # Write to J-Drive
+                smb_handler.write_to_jdrive(file_content, dest_path)
+                
+                success_count += 1
+                logger.info(f"Successfully transferred file: {filename}")
+                
+            except Exception as e:
+                logger.error(f"Error processing file {file_key}: {str(e)}")
+                continue
+        
+        logger.info(f"Transfer complete. Successfully transferred {success_count} of {len(s3_files)} files.")
+        return 0
+    
+    except Exception as e:
+        logger.error(f"Error in main process: {str(e)}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+__________
+
+Airflow Variables for S3 to J-Drive Transfer
+The following variables need to be set in Airflow for the S3 to J-Drive transfer DAG to function correctly. You can set these through the Airflow UI under Admin > Variables.
+AWS Configuration
+Variable NameDescriptionExample Valueaws_access_key_idAWS access key with permissions to read from the S3 bucketAKIAIOSFODNN7EXAMPLEaws_secret_access_keyAWS secret key corresponding to the access keywJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEYaws_regionAWS region where the S3 bucket is locatedus-west-2s3_bucketName of the S3 bucket containing the dataclinical-trials-datas3_prefixPath prefix within the S3 bucket (folder path)daily-exports/
+J-Drive Configuration
+Variable NameDescriptionExample Valuejdrive_pathPath within the J-Drive where files should be savedclinical-trials/data-importsfile_patternPattern of files to transfer (supports wildcards)*.json or report-*.csv
+Example Configuration Steps
+
+Navigate to the Airflow UI
+Go to Admin > Variables
+Add each variable individually:
+
+Click "Create"
+Enter the variable name (e.g., s3_bucket)
+Enter the variable value
+Click "Save"
+
+
+Repeat for all variables
+
+Security Considerations
+For production environments, consider using Airflow Connections instead of Variables for sensitive information like AWS credentials. This provides better security through Airflow's built-in encryption.
+To use Airflow Connections:
+
+Go to Admin > Connections
+Create a new connection:
+
+Conn Id: aws_s3
+Conn Type: Amazon Web Services
+Login: AWS Access Key ID
+Password: AWS Secret Access Key
+Extra: {"region_name": "us-west-2"}
+
+
+
+Then modify the DAG to use the connection instead of variables.
+
+--------
+
+# S3 to J-Drive Data Transfer Solution
+
+This project provides an Airflow-based solution for transferring data from Amazon S3 to a J-Drive shared location. It uses a Kubernetes Pod Operator approach similar to your existing Viewpoint data pull workflow.
+
+## Solution Overview
+
+The solution consists of:
+
+1. **Airflow DAG**: Orchestrates the process and schedules the data transfer
+2. **Docker Container**: Contains the logic to download from S3 and upload to J-Drive
+3. **SMB Authentication**: Uses vault tokens to securely authenticate with the J-Drive
+
+## Key Features
+
+- Kubernetes-based execution using KubernetesPodOperator
+- Vault-based authentication for J-Drive access
+- Support for file pattern matching
+- Configurable through Airflow variables
+- Error handling and retry logic
+- Email notifications for failures
+
+## Prerequisites
+
+- Kubernetes cluster with Airflow deployed
+- Access to registry for pushing Docker images (`iregistry.dords.kaiser.org`)
+- AWS credentials with S3 read access
+- J-Drive access credentials stored in Vault
+- Airflow connection configured for Kubernetes (`anp-cluster-conn`)
+
+## Files Included
+
+- `s3_to_jdrive_dag.py`: Airflow DAG definition file
+- `Dockerfile`: Container definition for the S3 to J-Drive transfer
+- `run.py`: Python script that handles the data transfer logic
+- `airflow_variables.md`: Documentation of required Airflow variables
+
+## Setup Instructions
+
+### 1. Build and Push the Docker Image
+
+```bash
+# Clone this repository
+git clone <repository-url>
+cd s3-to-jdrive-transfer
+
+# Build the Docker image
+docker build -t iregistry.dords.kaiser.org/s3-jdrive-pod:0.1 .
+
+# Push to registry
+docker push iregistry.dords.kaiser.org/s3-jdrive-pod:0.1
+```
+
+### 2. Configure Airflow Variables
+
+In the Airflow UI, navigate to Admin > Variables and set the following:
+
+- `aws_access_key_id`: AWS access key
+- `aws_secret_access_key`: AWS secret key
+- `aws_region`: AWS region (default: us-west-2)
+- `s3_bucket`: S3 bucket name
+- `s3_prefix`: S3 prefix (folder path)
+- `jdrive_path`: J-Drive path to save files to
+- `file_pattern`: File pattern to match (default: *.json)
+
+See `airflow_variables.md` for detailed information.
+
+### 3. Deploy the DAG
+
+Copy the `s3_to_jdrive_dag.py` file to your Airflow DAGs folder.
+
+### 4. Prepare Authentication Files
+
+Ensure that the vault token and authentication configuration are available at:
+- `/src/vault.token`: Contains the Vault token
+- `/src/auths.json`: Contains J-Drive configuration
+
+The `auths.json` should have the following structure:
+
+```json
+{
+  "JDrive": {
+    "Server": "server-name",
+    "Share": "share-name",
+    "Path": "base/path",
+    "Vault": {
+      "URL": "https://vault-url",
+      "Path": "path/to/credentials",
+      "MountPath": "mount-point"
+    }
+  }
+}
+```
+
+## Usage
+
+Once deployed, the DAG will:
+
+1. Run according to the schedule (default: daily)
+2. Launch the KubernetesPod with the S3 to J-Drive container
+3. Download matching files from S3
+4. Upload them to the specified J-Drive location
+5. Send email notifications on failure
+
+You can also trigger the DAG manually from the Airflow UI.
+
+## Security Considerations
+
+- The solution uses Vault for secure credential management
+- AWS credentials are passed securely via Airflow variables
+- J-Drive credentials are never stored directly in the code or container
+
+## Troubleshooting
+
+- Check Airflow task logs for detailed error messages
+- Verify that vault token and authentication files are accessible
+- Ensure the container has network access to both S3 and J-Drive
+- Check permissions on the J-Drive path
+
+## Similar to Your Existing DAG
+
+This solution follows the same pattern as your existing `viewpoint_pull` DAG:
+- Uses KubernetesPodOperator
+- Mounts volumes for data access
+- Configures resource requirements
+- Sets up appropriate authentication
+- Follows the same task flow structure (start → main_task → complete)
