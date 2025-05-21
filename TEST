@@ -1,62 +1,41 @@
 if outputFileType == "infer":
-    # Determine if we should use JSON format
-    if has_nested_data(df):
-        # Main file as JSON
-        outputFileType = "json"
-        
-        # Write the primary JSON file
-        if mode == "j-drive":
-            f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
-        else:
-            f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
-        
-        # Write standard JSON
-        df.write_json(f)
-        f.close()
-        
-        # Create the secondary NDJSON file
-        if mode == "j-drive":
-            # Create path to ndjson subfolder
-            ndjson_path = f"{JDriveResources['Path']}/ndjson/{endpoint}_Response.ndjson"
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(ndjson_path), exist_ok=True)
-            # Write NDJSON file
-            df.write_ndjson(ndjson_path)
-        else:
-            # For local mode
-            ndjson_path = f"query_results/ndjson/{endpoint}_Response.ndjson"
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(ndjson_path), exist_ok=True)
-            # Write NDJSON file
-            df.write_ndjson(ndjson_path)
-        
-        print(f"Created JSON file and NDJSON file in {os.path.dirname(ndjson_path)}")
-    else:
-        # No nested data, use TSV
-        outputFileType = "tsv"
-        if mode == "j-drive":
-            f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
-        else:
-            f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
-        
-        content = df.write_csv(f, separator='\t')
-        f.close()
-elif outputFileType == "json":
-    # Just JSON file requested
-    if mode == "j-drive":
-        f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
-    else:
-        f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
+    outputFileType = 'json' if has_nested_data(df) else 'tsv'
+
+if mode == "display":
+    print(response_data)
+elif mode == "j-drive":
+    f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
+else:
+    f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
+
+if outputFileType == 'json':
+    # Change from df.write_ndjson() to df.write_json() for proper JSON format
+    content = df.write_json()  # This should be df.write_json(), not ndjson
+    f.write(content)
     
-    df.write_json(f)
-    f.close()
-elif outputFileType == "ndjson":
-    # Just NDJSON file requested
+    # Add this section to create NDJSON file in the ndjson subfolder
     if mode == "j-drive":
-        f = getJDriveFile(file_path=outputFilename, mode="w", endpoint=endpoint, file_extension=outputFileType)
+        ndjson_dir = os.path.join(JDriveResources["Path"], "ndjson")
+        os.makedirs(ndjson_dir, exist_ok=True)
+        ndjson_path = os.path.join(ndjson_dir, f"{endpoint}_Response.ndjson")
+        with open(ndjson_path, "w") as ndjson_file:
+            ndjson_content = df.write_ndjson()
+            ndjson_file.write(ndjson_content)
     else:
-        f = getLocalFile(endpoint=endpoint, outputFilename=outputFilename, file_extension=outputFileType)
+        ndjson_dir = "query_results/ndjson"
+        os.makedirs(ndjson_dir, exist_ok=True)
+        ndjson_path = os.path.join(ndjson_dir, f"{endpoint}_Response.ndjson")
+        with open(ndjson_path, "w") as ndjson_file:
+            ndjson_content = df.write_ndjson()
+            ndjson_file.write(ndjson_content)
     
-    df.write_ndjson(f)
-    f.close()
-# [Keep your existing code for other formats]
+elif outputFileType == 'tsv':
+    content = df.write_csv(separator='\t')
+    f.write(content)
+elif outputFileType == 'avro':
+    df.write_parquet('temp.parquet')
+    # avro writing bug workaround
+    pl.read_parquet("temp.parquet").write_avro(f)
+elif outputFileType == 'parquet':
+    df.write_parquet(f)
+f.close()
