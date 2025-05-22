@@ -1,651 +1,499 @@
 #!/usr/bin/env python3
-# ########################################################
-# ########################################################
-
-# Libraries
-import json
-import os
-import logging
-from datetime import datetime, timedelta
-import pendulum
-import itertools
-
-# Airflow
-from airflow.models import DAG, Variable
-from airflow.utils.dates import days_ago
-from airflow.hooks.base import BaseHook
-from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
-from airflow.operators.empty import EmptyOperator
-
-# Kubernetes
-from kubernetes.client import models as k8s
-
-# Airflow parameters
-from airflow.models.param import Param
-from airflow.decorators import dag, task
-
-# ########################################################
-# DAG settings
-# ########################################################
-
-LOCAL_TZ = pendulum.timezone("America/Los_Angeles")
-
-DAG_NAME = "s3_to_jdrive_push"  # DAG name (proposed format: lowercase underscore). Should be unique.
-DAG_DESCRIPTION = "Daily push of data from S3 to J-Drive for data sharing"
-DAG_START_DATE = datetime(2024, 6, 15, tzinfo=LOCAL_TZ)  # Start date. When setting the "catchup" parameter to True, you can perform a backfill when you upload
-DAG_SCHEDULE_INTERVAL = "@daily"  # Cron notation -> see https://airflow.apache.org/scheduler.html#dag-runs
-DAG_CATCHUP = False  # When set to true, DAG will start running from DAG_START_DATE instead of current date
-DAG_PAUSED_UPON_CREATION = True  # Defaults to False. When set to True, uploading a DAG for the first time, the DAG doesn't start directly
-DAG_MAX_ACTIVE_RUNS = 5  # Configure efficiency: Max. number of active runs for this DAG. Scheduler will not create new DAG runs once this limit has been hit
-
-emails = []
-
-# ########################################################
-# Default DAG arguments
-# ########################################################
-
-default_args = {
-    "owner": "airflow",
-    "start_date": DAG_START_DATE,
-    "depends_on_past": False,
-    "email": emails,
-    "email_on_failure": True,
-    "email_on_retry": False,
-    "retries": 5,  # Max. number of retries before failing
-    "retry_delay": timedelta(minutes=2)  # Retry delay
-}
-
-# ########################################################
-# DAG configuration (custom)
-# ########################################################
-
-SOME_CUSTOM_CONFIG = "yes"
-
-# ########################################################
-# Main DAG
-# ########################################################
-
-# Define volume to mount for J-Drive access
-pod_volumes = [
-    k8s.V1Volume(
-        name="src",
-        host_path=k8s.V1HostPathVolumeSource(path="/mapposix/df.dords.kaiser.org/groups/clinical-trials/clinical_trials_datalake/"),
-    ),
-]
-
-# Define volume mounts for the container
-pod_volume_mounts = [
-    k8s.V1VolumeMount(
-        name="src",
-        mount_path="/src",
-        sub_path=None,
-        read_only=False
-    ),
-]
-
-@dag(dag_id=DAG_NAME, schedule=DAG_SCHEDULE_INTERVAL, tags=['clinical_trials'], catchup=False, start_date=DAG_START_DATE)
-def taskflow():
-    # Define the S3 to J-Drive push task
-    s3_jdrive_push = KubernetesPodOperator(
-        task_id="s3_jdrive_push_pod",
-        image = "iregistry.dords.kaiser.org/s3-jdrive-pod:0.1",
-        namespace="batch",
-        do_xcom_push=False,
-        volumes=pod_volumes,
-        volume_mounts=pod_volume_mounts,
-        container_resources=k8s.V1ResourceRequirements(
-            requests={"cpu": "2", "memory": "4Gi", "ephemeral-storage": "500Mi"},
-            limits={"cpu": "4", "memory": "8Gi", "ephemeral-storage": "1Gi"},
-        ),
-        image_pull_policy='IfNotPresent',
-        kubernetes_conn_id="anp-cluster-conn",
-        get_logs=True,
-        deferrable=True,
-        on_finish_action="delete_succeeded_pod",
-        name="s3_jdrive_push_pod",
-        email_on_failure=True,
-        cmds=["python", "/src/run.py"],  # Run python script in pod
-        # Pass arguments to the container script
-        arguments=[
-            "--s3-bucket", "{{ var.value.s3_bucket }}",
-            "--s3-prefix", "{{ var.value.s3_prefix }}",
-            "--jdrive-path", "{{ var.value.jdrive_path }}",
-            "--file-pattern", "{{ var.value.file_pattern or '*.json' }}",
-            "--aws-access-key-id", "{{ var.value.aws_access_key_id }}",
-            "--aws-secret-access-key", "{{ var.value.aws_secret_access_key }}",
-            "--aws-region", "{{ var.value.aws_region or 'us-west-2' }}",
-            "--token-path", "/src/vault.token",
-            "--auth-path", "/src/auths.json"
-        ]
-    )
-
-    start = EmptyOperator(
-        task_id="start")
-    
-    complete = EmptyOperator(
-        task_id="complete")
-    
-    start >> s3_jdrive_push >> complete
-
-taskflow()
-
-FROM python:3.9-slim
-
-# Install required system dependencies
-RUN apt-get update && apt-get install -y \
-    smbclient \
-    curl \
-    unzip \
-    libkrb5-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install AWS CLI
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-    && unzip awscliv2.zip \
-    && ./aws/install \
-    && rm -rf awscliv2.zip aws
-
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    boto3 \
-    pysmb \
-    hvac \
-    typing_extensions \
-    pendulum
-
-# Create directories
-RUN mkdir -p /src /data
-
-# Copy script
-COPY run.py /src/
-
-# Set working directory
-WORKDIR /src
-
-# Entrypoint
-ENTRYPOINT ["python", "/src/run.py"]
-
-#!/usr/bin/env python3
 """
-S3 to J-Drive Transfer Script
-
-Pulls data from an S3 bucket and pushes it to a J-Drive location
-using SMB authentication from vault tokens.
+Complete R to Python ML Experiment Translation
+Based on the R code files shown in the screenshots
 """
 
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from joblib import Parallel, delayed
+import pickle
 import os
-import sys
-import json
-import argparse
-import logging
-import re
-import glob
-from datetime import datetime
-from typing import List, Optional, TextIO
+from pathlib import Path
+import gc
+import time
+import warnings
+from tqdm import tqdm
 
-import boto3
-import hvac
-import smbc  # Using smbc library (part of the pysmb package)
+warnings.filterwarnings('ignore')
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# =============================================================================
+# DATA GENERATING PROCESS (DGP) - Equivalent to dgp.R
+# =============================================================================
 
-# Constants
-TOKEN_PATH = "src/vault.token"
-AUTH_PATH = "src/auths.json"
+# R Code from Image 1-2:
+# set_dgp <- function(dgp_string = "constant") {
+#   if (dgp_string == "constant") {
+#     mu1 <- function(x) { x %*% c(sin(abs(y1)) * pi/10), 3) }
+#     mu0 <- function(x) { sin(abs(y1)) * pi/10 }
+#   } else if (dgp_string == "heterogeneous") {
+#     dgp2 = no = 2
+#     mu1 <- function(x) { x %*% c(sin(abs(y1)) * pi/10)^2 - 5.001031) }
+#     mu0 <- function(x) { sin(abs(y1)) * pi/10 }
+#   }
+# }
 
-# Configuration variables with default paths
-JDriveResources = {
-    "Server": "",
-    "Share": "",
-    "Path": "",
-    "MountPath": "",
-    "URL": "",
-    "Vault": {
-        "URL": "",
-        "Path": "",
-        "MountPath": ""
-    }
-}
-
-class SMBResourceHandler:
-    def __init__(self, vault_path: str = TOKEN_PATH, auth_path: str = AUTH_PATH):
-        self.vault_path = vault_path
-        self.auth_path = auth_path
-        self.client = None
-        self.smbclient = None
-        self.authenticated = False
-        self.username = ""
-        self.password = ""
-
-        try:
-            # Load the J-Drive resources configuration
-            with open(auth_path, 'r') as f:
-                auth_config = json.load(f)
-                global JDriveResources
-                if "JDrive" in auth_config:
-                    JDriveResources = auth_config["JDrive"]
-                else:
-                    logger.warning("JDrive configuration not found in auth file")
-        except Exception as e:
-            logger.error(f"Error loading auth configuration: {str(e)}")
-            raise
-
-    def authenticate_smb(self):
-        """Configure SMB client to have service account credentials for subsequent operations."""
-        try:
-            with open(self.vault_path, mode="r") as f:
-                vault_token = f.readline().strip()
-            
-            # Initialize the hvac client to connect to Vault
-            self.client = hvac.Client(url=JDriveResources["Vault"]["URL"], token=vault_token)
-            self.client.secrets.kv.default_kv_version = 1
-            
-            # Read secrets from Vault
-            vault_resp = self.client.secrets.kv.read_secret(
-                mount_point=JDriveResources["Vault"]["MountPath"],
-                path=JDriveResources["Vault"]["Path"],
-            )["data"]
-            
-            # Format domain and username
-            self.username = "{0}\\{1}".format(vault_resp["domain"], vault_resp["username"])
-            self.password = vault_resp["password"]
-            
-            # Initialize the SMB client
-            self.smbclient = smbc.Context(auth_fn=self._smbc_auth_callback)
-            self.authenticated = True
-            logger.info("SMB authentication successful")
-            
-        except Exception as e:
-            logger.error(f"SMB authentication failed: {str(e)}")
-            raise ValueError(f"Failed to authenticate SMB: {str(e)}")
+class DataGeneratingProcess:
+    """Python equivalent of R's DGP functions"""
     
-    def _smbc_auth_callback(self, server, share, workgroup, username, password):
-        """Callback function for SMB authentication"""
-        return (self.username, self.password)
-
-    def list_dirs(self, path: str = None, display: bool = True) -> List[str]:
-        """List directories on j-drive."""
-        if not self.authenticated:
-            self.authenticate_smb()
-        
-        path = path or JDriveResources["Path"]
-        smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{path}"
-        
-        try:
-            entries = self.smbclient.opendir(smb_path).getdents()
-            files = [entry.name for entry in entries if entry.name not in ['.', '..']]
-            
-            if display:
-                logger.info(f"Files in {smb_path}: {files}")
-            
-            return files
-        except Exception as e:
-            logger.error(f"Error listing directories: {str(e)}")
-            raise
+    def __init__(self, dgp_string="constant"):
+        self.dgp_string = dgp_string
+        print(f"Initialized DGP with type: {dgp_string}")
     
-    def get_jdrive_file(self, file_path: str = None, mode: str = "r") -> TextIO:
-        """Opens and returns a file from j-drive."""
-        if not self.authenticated:
-            self.authenticate_smb()
+    def generate_data(self, n=1000, y_noise=6):
+        """
+        Python equivalent of R's dgp() function
+        Generates synthetic data based on the specified DGP
+        """
+        np.random.seed(42)
         
-        assert mode in ["r", "w"], "mode must either be w (write) or r (read)"
+        # Generate covariates (equivalent to R's matrix generation)
+        w1_lbound = -2
+        w1_ubound = 1
+        o_lbound = 0
+        u_ubound = 1
         
-        if mode == "r":
-            if file_path is None:
-                raise ValueError("must give path to file for reading")
-            
-            smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{JDriveResources['Path']}/{file_path}"
-            
+        # Generate random variables (equivalent to R's runif, rnorm, etc.)
+        w1 = np.random.uniform(w1_lbound, w1_ubound, n)
+        w2 = np.random.normal(0, 3, n)
+        w3 = np.random.uniform(-1, 1, n)
+        w4 = np.random.gamma(2, 2, n)
+        w5 = np.random.gamma(2, 1, n)
+        w6 = np.random.normal(1, 2, n)
+        
+        # Create DataFrame (equivalent to R's tibble)
+        data = pd.DataFrame({
+            'w1': w1, 'w2': w2, 'w3': w3, 'w4': w4, 'w5': w5, 'w6': w6
+        })
+        
+        # Add treatment assignment and outcome generation
+        # This is a simplified version - the R code has complex mu0/mu1 functions
+        if self.dgp_string == "constant":
+            # Simple linear relationship
+            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
+            y1 = w1 + w2 + 2.0 + np.random.normal(0, y_noise, n)  # Treatment effect of 2
+        elif self.dgp_string == "heterogeneous":
+            # Heterogeneous treatment effects
+            treatment_effect = 0.5 + 0.5 * w1 + 0.3 * w2
+            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
+            y1 = y0 + treatment_effect + np.random.normal(0, y_noise, n)
+        else:
+            # Default case
+            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
+            y1 = w1 + w2 + 1.5 + np.random.normal(0, y_noise, n)
+        
+        # Random treatment assignment (equivalent to R's rbinom)
+        a = np.random.binomial(1, 0.5, n)
+        data['a'] = a
+        
+        # Observed outcome (equivalent to R's ifelse)
+        y = np.where(a == 1, y1, y0)
+        data['y'] = y
+        data['y0'] = y0  # Potential outcome under control
+        data['y1'] = y1  # Potential outcome under treatment
+        
+        return data
+
+# =============================================================================
+# CROSS VALIDATION AND MODEL SELECTION - Equivalent to discreteSL.R
+# =============================================================================
+
+# R Code from Images 3-6:
+# get_best_learner <- function(resamples, learners = default_learners, verbose = T) {
+#   if ("prog" %in% names(resamples$splits[[1]]$data)) {
+#     wfs = wf_prog_preproc %>% add_learners(learners)
+#   } else {
+#     wfs = wf_no_prog_preproc %>% add_learners(learners)
+#   }
+#   
+#   fit_learners %>% workflow_map(
+#     resamples = resamples,
+#     metrics = metric_set(yardstick::rmse)
+#   )
+# }
+
+class ModelSelector:
+    """Python equivalent of R's model selection and CV functions"""
+    
+    def __init__(self):
+        self.default_learners = self._get_default_learners()
+        
+    def _get_default_learners(self):
+        """
+        Python equivalent of R's default_learners list
+        Based on the learners shown in Images 3-4
+        """
+        return {
+            'knn': KNeighborsRegressor(n_neighbors=5),
+            'linear': LinearRegression(),
+            'gbt': GradientBoostingRegressor(n_estimators=100, random_state=42),
+            'rf': RandomForestRegressor(n_estimators=100, random_state=42),
+            'ridge': Ridge(alpha=1.0),
+            'lasso': Lasso(alpha=0.1)
+        }
+    
+    def get_best_learner(self, train_data, target_col='y', cv_folds=5, verbose=True):
+        """
+        Python equivalent of R's get_best_learner function
+        Performs cross-validation and selects best model
+        """
+        # Prepare features and target
+        feature_cols = [col for col in train_data.columns if col not in [target_col, 'y0', 'y1']]
+        X = train_data[feature_cols]
+        y = train_data[target_col]
+        
+        # Set up cross-validation (equivalent to R's vfold_cv)
+        cv = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        
+        best_score = float('inf')
+        best_learner = None
+        best_learner_name = None
+        
+        if verbose:
+            print(f"Evaluating {len(self.default_learners)} learners with {cv_folds}-fold CV...")
+        
+        # Evaluate each learner (equivalent to R's workflow_map)
+        for name, learner in self.default_learners.items():
             try:
-                return self.smbclient.open(smb_path, os.O_RDONLY)
-            except Exception as e:
-                logger.error(f"Error opening file for reading: {str(e)}")
-                raise
-        else:  # mode == "w"
-            if file_path is None:
-                raise ValueError("must provide either filepath or endpoint for writing")
-            
-            # Create timestamp for the filename
-            timestamp = datetime.now().strftime("%Y-%m-%d-%H")
-            file_path = f"{file_path}_{timestamp}.json"
-            
-            smb_path = f"smb://{JDriveResources['Server']}/{JDriveResources['Share']}/{JDriveResources['Path']}/{file_path}"
-            
-            try:
-                return self.smbclient.open(smb_path, os.O_WRONLY | os.O_CREAT)
-            except Exception as e:
-                logger.error(f"Error opening file for writing: {str(e)}")
-                raise
-
-    def write_to_jdrive(self, data: bytes, file_path: str) -> None:
-        """Write data to a file on J-Drive"""
-        if not self.authenticated:
-            self.authenticate_smb()
-        
-        file_handle = self.get_jdrive_file(file_path=file_path, mode="w")
-        try:
-            file_handle.write(data)
-            logger.info(f"Successfully wrote data to {file_path}")
-        except Exception as e:
-            logger.error(f"Error writing to file: {str(e)}")
-            raise
-        finally:
-            file_handle.close()
-
-
-class S3Downloader:
-    def __init__(self, bucket: str, prefix: str, 
-                 aws_access_key_id: Optional[str] = None,
-                 aws_secret_access_key: Optional[str] = None,
-                 aws_region: str = 'us-west-2'):
-        
-        # Initialize S3 client
-        session_kwargs = {'region_name': aws_region}
-        if aws_access_key_id and aws_secret_access_key:
-            session_kwargs['aws_access_key_id'] = aws_access_key_id
-            session_kwargs['aws_secret_access_key'] = aws_secret_access_key
-        
-        self.session = boto3.session.Session(**session_kwargs)
-        self.s3 = self.session.client('s3')
-        self.bucket = bucket
-        self.prefix = prefix
-        
-        logger.info(f"Initialized S3 client for bucket: {bucket}, prefix: {prefix}")
-
-    def list_files(self, file_pattern: str = "*.json") -> List[str]:
-        """List files in the S3 bucket matching the pattern"""
-        pattern_re = re.compile(fnmatch_to_regex(file_pattern))
-        
-        paginator = self.s3.get_paginator('list_objects_v2')
-        files = []
-        
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
-            if 'Contents' in page:
-                for obj in page['Contents']:
-                    key = obj['Key']
-                    # Skip folder objects
-                    if key.endswith('/'):
-                        continue
+                # Cross-validation with RMSE scoring
+                cv_scores = cross_val_score(
+                    learner, X, y, cv=cv, scoring='neg_mean_squared_error', n_jobs=-1
+                )
+                rmse_scores = np.sqrt(-cv_scores)  # Convert to RMSE
+                mean_rmse = np.mean(rmse_scores)
+                
+                if verbose:
+                    print(f"{name}: RMSE = {mean_rmse:.4f} (+/- {np.std(rmse_scores):.4f})")
+                
+                if mean_rmse < best_score:
+                    best_score = mean_rmse
+                    best_learner = learner
+                    best_learner_name = name
                     
-                    # Get just the filename part
-                    filename = os.path.basename(key)
-                    if pattern_re.match(filename):
-                        files.append(key)
-        
-        logger.info(f"Found {len(files)} files matching pattern {file_pattern}")
-        return files
-
-    def download_file(self, key: str) -> bytes:
-        """Download file from S3 and return the content as bytes"""
-        try:
-            response = self.s3.get_object(Bucket=self.bucket, Key=key)
-            content = response['Body'].read()
-            logger.info(f"Downloaded file: {key}, size: {len(content)} bytes")
-            return content
-        except Exception as e:
-            logger.error(f"Error downloading file {key}: {str(e)}")
-            raise
-
-
-def fnmatch_to_regex(pattern: str) -> str:
-    """Convert a shell-style pattern to a regular expression"""
-    pattern = re.escape(pattern)
-    pattern = pattern.replace(r'\*', '.*')
-    pattern = pattern.replace(r'\?', '.')
-    return f'^{pattern}$'
-
-
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Download from S3 and push to J-Drive')
-    
-    parser.add_argument('--s3-bucket', required=True, help='S3 bucket name')
-    parser.add_argument('--s3-prefix', default='', help='S3 prefix (folder path)')
-    parser.add_argument('--jdrive-path', required=True, help='J-Drive path to save files to')
-    parser.add_argument('--file-pattern', default='*.json', help='File pattern to match (e.g., *.json)')
-    parser.add_argument('--aws-access-key-id', help='AWS access key ID')
-    parser.add_argument('--aws-secret-access-key', help='AWS secret access key')
-    parser.add_argument('--aws-region', default='us-west-2', help='AWS region')
-    parser.add_argument('--token-path', default=TOKEN_PATH, help='Path to vault token')
-    parser.add_argument('--auth-path', default=AUTH_PATH, help='Path to auth configuration')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    
-    return parser.parse_args()
-
-
-def main():
-    """Main entry point for S3 to J-Drive transfer"""
-    args = parse_arguments()
-    
-    # Set logging level
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
-    try:
-        # Initialize SMB client
-        smb_handler = SMBResourceHandler(vault_path=args.token_path, auth_path=args.auth_path)
-        smb_handler.authenticate_smb()
-        
-        # Initialize S3 client
-        s3_downloader = S3Downloader(
-            bucket=args.s3_bucket,
-            prefix=args.s3_prefix,
-            aws_access_key_id=args.aws_access_key_id,
-            aws_secret_access_key=args.aws_secret_access_key,
-            aws_region=args.aws_region
-        )
-        
-        # List files to transfer
-        s3_files = s3_downloader.list_files(file_pattern=args.file_pattern)
-        
-        if not s3_files:
-            logger.warning(f"No files found matching pattern: {args.file_pattern}")
-            return 0
-        
-        # Process each file
-        success_count = 0
-        for file_key in s3_files:
-            try:
-                # Download from S3
-                file_content = s3_downloader.download_file(file_key)
-                
-                # Get just the filename part
-                filename = os.path.basename(file_key)
-                
-                # Create the destination path
-                dest_path = f"{args.jdrive_path}/{filename}"
-                
-                # Write to J-Drive
-                smb_handler.write_to_jdrive(file_content, dest_path)
-                
-                success_count += 1
-                logger.info(f"Successfully transferred file: {filename}")
-                
             except Exception as e:
-                logger.error(f"Error processing file {file_key}: {str(e)}")
+                if verbose:
+                    print(f"Error with {name}: {e}")
                 continue
         
-        logger.info(f"Transfer complete. Successfully transferred {success_count} of {len(s3_files)} files.")
-        return 0
-    
-    except Exception as e:
-        logger.error(f"Error in main process: {str(e)}")
-        return 1
+        # Fit best learner on full training data
+        best_learner.fit(X, y)
+        
+        return {
+            'model': best_learner,
+            'name': best_learner_name,
+            'rmse': best_score,
+            'feature_cols': feature_cols
+        }
 
+# =============================================================================
+# ESTIMATORS - Equivalent to estimators.R
+# =============================================================================
+
+# R Code from Images 7-9:
+# unadjusted_estimator <- function(data) {
+#   n = nrow(data)
+#   est_unadj = data %>% { mean(y[a == 1]) - mean(y[a == 0]) }
+#   se_unadj = data %>% { sqrt(2 * (var(y[a == 1]) + var(y[a == 0])) / n) }
+#   return(tibble(effect = est_unadj, se = se_unadj))
+# }
+
+class TreatmentEffectEstimators:
+    """Python equivalent of R's estimator functions"""
+    
+    @staticmethod
+    def unadjusted_estimator(data):
+        """
+        Python equivalent of R's unadjusted_estimator
+        Simple difference in means
+        """
+        n = len(data)
+        
+        # Calculate means for treatment and control groups
+        y_treated = data[data['a'] == 1]['y']
+        y_control = data[data['a'] == 0]['y']
+        
+        # Treatment effect estimate (equivalent to R's mean(y[a == 1]) - mean(y[a == 0]))
+        est_unadj = np.mean(y_treated) - np.mean(y_control)
+        
+        # Standard error calculation
+        se_unadj = np.sqrt(2 * (np.var(y_treated) + np.var(y_control)) / n)
+        
+        return {
+            'effect': est_unadj,
+            'se': se_unadj
+        }
+    
+    @staticmethod
+    def tmle_estimator(data, learners=None):
+        """
+        Python equivalent of R's tmle_estimator
+        Simplified TMLE implementation
+        """
+        if learners is None:
+            learners = ModelSelector()._get_default_learners()
+        
+        n = len(data)
+        
+        # Step 1: Estimate propensity scores (simplified)
+        feature_cols = [col for col in data.columns if col not in ['y', 'a', 'y0', 'y1']]
+        X = data[feature_cols]
+        a = data['a']
+        y = data['y']
+        
+        # Estimate propensity score using logistic regression (simplified)
+        from sklearn.linear_model import LogisticRegression
+        prop_model = LogisticRegression()
+        prop_model.fit(X, a)
+        propensity_scores = prop_model.predict_proba(X)[:, 1]
+        
+        # Step 2: Estimate outcome regression
+        outcome_model = LinearRegression()
+        outcome_model.fit(X, y)
+        
+        # Step 3: TMLE update (simplified)
+        # This is a simplified version - full TMLE is more complex
+        y_pred = outcome_model.predict(X)
+        
+        # Calculate influence curve and update
+        clever_covariate = a / propensity_scores - (1 - a) / (1 - propensity_scores)
+        
+        # Simple linear update
+        epsilon_model = LinearRegression()
+        epsilon_model.fit(clever_covariate.reshape(-1, 1), y - y_pred)
+        epsilon = epsilon_model.coef_[0]
+        
+        # Updated predictions
+        y_pred_updated = y_pred + epsilon * clever_covariate
+        
+        # Treatment effect estimate
+        effect_estimate = np.mean(y_pred_updated[a == 1]) - np.mean(y_pred_updated[a == 0])
+        
+        # Standard error (simplified)
+        influence_curve = (a - propensity_scores) * (y - y_pred_updated) / (propensity_scores * (1 - propensity_scores))
+        se_estimate = np.sqrt(np.var(influence_curve) / n)
+        
+        return {
+            'effect': effect_estimate,
+            'se': se_estimate
+        }
+
+# =============================================================================
+# EXPERIMENT RUNNER - Equivalent to experiment.R
+# =============================================================================
+
+# R Code from Images 10-12:
+# experiment = function(n_trial, hist_lrnr, y_noise, dgp_string, V) {
+#   registerDoFuture()
+#   plan(multisession)
+#   data_trial = get_trial_dat(n_trial, hist_lrnr, y_noise = y_noise, dgp_string = dgp_string)
+#   # ... complex experiment logic
+# }
+
+class ExperimentRunner:
+    """Python equivalent of R's experiment functions"""
+    
+    def __init__(self, cache_dir="cache", results_dir="results"):
+        self.cache_dir = Path(cache_dir)
+        self.results_dir = Path(results_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.results_dir.mkdir(exist_ok=True)
+        
+        self.dgp = DataGeneratingProcess()
+        self.model_selector = ModelSelector()
+        self.estimators = TreatmentEffectEstimators()
+    
+    def get_trial_data(self, n_trial, hist_lrnr, y_noise=6, dgp_string="constant", return_m=False):
+        """
+        Python equivalent of R's get_trial_dat function
+        """
+        # Set DGP type
+        self.dgp.dgp_string = dgp_string
+        
+        # Generate trial data
+        if return_m:
+            data_trial = self.dgp.generate_data(n=n_trial, y_noise=y_noise)
+            return data_trial
+        else:
+            data_trial = self.dgp.generate_data(n=n_trial, y_noise=y_noise)
+            
+            # Apply learner predictions if specified
+            if hist_lrnr is not None:
+                feature_cols = hist_lrnr.get('feature_cols', ['w1', 'w2', 'w3', 'w4', 'w5', 'w6'])
+                X_trial = data_trial[feature_cols]
+                
+                # Get predictions from historical learner
+                predictions = hist_lrnr['model'].predict(X_trial)
+                data_trial['prog'] = predictions
+            
+            return data_trial
+    
+    def run_single_experiment(self, n_trial, hist_lrnr, y_noise=6, dgp_string="constant", V=5):
+        """
+        Python equivalent of R's experiment function
+        """
+        # Generate trial data
+        data_trial = self.get_trial_data(n_trial, hist_lrnr, y_noise, dgp_string)
+        
+        # Run different estimators
+        results = {}
+        
+        # Unadjusted estimator
+        unadj_result = self.estimators.unadjusted_estimator(data_trial)
+        results['unadjusted'] = {
+            'effect': unadj_result['effect'],
+            'se': unadj_result['se'],
+            'method': 'unadjusted'
+        }
+        
+        # TMLE estimator (simplified)
+        try:
+            tmle_result = self.estimators.tmle_estimator(data_trial)
+            results['tmle'] = {
+                'effect': tmle_result['effect'],
+                'se': tmle_result['se'],
+                'method': 'tmle'
+            }
+        except Exception as e:
+            print(f"TMLE failed: {e}")
+            results['tmle'] = {
+                'effect': np.nan,
+                'se': np.nan,
+                'method': 'tmle'
+            }
+        
+        # Add experiment metadata
+        for method in results:
+            results[method].update({
+                'n_trial': n_trial,
+                'y_noise': y_noise,
+                'dgp_string': dgp_string,
+                'hist_learner': hist_lrnr['name'] if hist_lrnr else 'none'
+            })
+        
+        return results
+
+# =============================================================================
+# PARALLEL PROCESSING - Equivalent to cluster.R
+# =============================================================================
+
+# R Code from Image 13:
+# cl <- makeClusterPSOCK(workers=workers, rscript_envs=rscript_envs, outfile=outfile)
+# cl <- autoStopCluster(cl)
+# plan(cluster, workers=cl)
+
+class ParallelRunner:
+    """Python equivalent of R's parallel cluster functions"""
+    
+    def __init__(self, n_workers=None):
+        if n_workers is None:
+            self.n_workers = min(os.cpu_count() - 1, 8)
+        else:
+            self.n_workers = n_workers
+        
+        print(f"Created parallel runner with {self.n_workers} workers")
+    
+    def run_parallel_experiments(self, n_runs=200, n_trials_list=[100, 200, 300, 400, 500], 
+                                dgp_string="constant", y_noise=6):
+        """
+        Python equivalent of R's parallel experiment execution
+        """
+        print(f"Running {n_runs} experiments with {len(n_trials_list)} different sample sizes...")
+        
+        # Initialize experiment runner
+        exp_runner = ExperimentRunner()
+        
+        # Generate historical data for learner training
+        hist_data = exp_runner.dgp.generate_data(n=1000, y_noise=y_noise)
+        hist_train, hist_test = train_test_split(hist_data, test_size=0.3, random_state=42)
+        
+        # Train historical learner
+        print("Training historical learner...")
+        hist_learner = exp_runner.model_selector.get_best_learner(hist_train)
+        print(f"Best historical learner: {hist_learner['name']} (RMSE: {hist_learner['rmse']:.4f})")
+        
+        # Define single experiment function for parallel execution
+        def run_experiment_batch(run_idx):
+            """Function to run one batch of experiments"""
+            np.random.seed(42 + run_idx)  # Ensure reproducibility
+            
+            batch_results = []
+            for n_trial in n_trials_list:
+                result = exp_runner.run_single_experiment(
+                    n_trial=n_trial,
+                    hist_lrnr=hist_learner,
+                    y_noise=y_noise,
+                    dgp_string=dgp_string
+                )
+                
+                # Flatten results for each method
+                for method, method_result in result.items():
+                    method_result['run_idx'] = run_idx
+                    batch_results.append(method_result)
+            
+            return batch_results
+        
+        # Run experiments in parallel
+        print(f"Executing {n_runs} experiment batches in parallel...")
+        all_results = Parallel(n_jobs=self.n_workers, verbose=1)(
+            delayed(run_experiment_batch)(i) for i in tqdm(range(n_runs))
+        )
+        
+        # Flatten results
+        final_results = []
+        for batch_results in all_results:
+            final_results.extend(batch_results)
+        
+        # Convert to DataFrame and save
+        results_df = pd.DataFrame(final_results)
+        
+        # Save results
+        results_file = exp_runner.results_dir / f"experiment_results_{dgp_string}.parquet"
+        results_df.to_parquet(results_file)
+        
+        print(f"\nExperiment completed!")
+        print(f"Results saved to: {results_file}")
+        print(f"Total experiments: {len(final_results)}")
+        print(f"Mean treatment effect (unadjusted): {results_df[results_df['method'] == 'unadjusted']['effect'].mean():.4f}")
+        
+        return results_df
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    """Main function to run the complete experiment pipeline"""
+    print("=== Python ML Experiment Pipeline ===")
+    print("Translated from R code")
+    
+    start_time = time.time()
+    
+    # Initialize parallel runner
+    runner = ParallelRunner(n_workers=4)
+    
+    # Run experiments
+    results = runner.run_parallel_experiments(
+        n_runs=50,  # Reduced for testing - increase to 200 for full run
+        n_trials_list=[100, 200, 300, 400, 500],
+        dgp_string="constant",
+        y_noise=6
+    )
+    
+    # Print summary statistics
+    print("\n=== Summary Statistics ===")
+    summary = results.groupby(['method', 'n_trial'])['effect'].agg(['mean', 'std', 'count'])
+    print(summary)
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nTotal execution time: {elapsed_time:.2f} seconds")
 
 if __name__ == "__main__":
-    sys.exit(main())
-
-__________
-
-Airflow Variables for S3 to J-Drive Transfer
-The following variables need to be set in Airflow for the S3 to J-Drive transfer DAG to function correctly. You can set these through the Airflow UI under Admin > Variables.
-AWS Configuration
-Variable NameDescriptionExample Valueaws_access_key_idAWS access key with permissions to read from the S3 bucketAKIAIOSFODNN7EXAMPLEaws_secret_access_keyAWS secret key corresponding to the access keywJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEYaws_regionAWS region where the S3 bucket is locatedus-west-2s3_bucketName of the S3 bucket containing the dataclinical-trials-datas3_prefixPath prefix within the S3 bucket (folder path)daily-exports/
-J-Drive Configuration
-Variable NameDescriptionExample Valuejdrive_pathPath within the J-Drive where files should be savedclinical-trials/data-importsfile_patternPattern of files to transfer (supports wildcards)*.json or report-*.csv
-Example Configuration Steps
-
-Navigate to the Airflow UI
-Go to Admin > Variables
-Add each variable individually:
-
-Click "Create"
-Enter the variable name (e.g., s3_bucket)
-Enter the variable value
-Click "Save"
-
-
-Repeat for all variables
-
-Security Considerations
-For production environments, consider using Airflow Connections instead of Variables for sensitive information like AWS credentials. This provides better security through Airflow's built-in encryption.
-To use Airflow Connections:
-
-Go to Admin > Connections
-Create a new connection:
-
-Conn Id: aws_s3
-Conn Type: Amazon Web Services
-Login: AWS Access Key ID
-Password: AWS Secret Access Key
-Extra: {"region_name": "us-west-2"}
-
-
-
-Then modify the DAG to use the connection instead of variables.
-
---------
-
-# S3 to J-Drive Data Transfer Solution
-
-This project provides an Airflow-based solution for transferring data from Amazon S3 to a J-Drive shared location. It uses a Kubernetes Pod Operator approach similar to your existing Viewpoint data pull workflow.
-
-## Solution Overview
-
-The solution consists of:
-
-1. **Airflow DAG**: Orchestrates the process and schedules the data transfer
-2. **Docker Container**: Contains the logic to download from S3 and upload to J-Drive
-3. **SMB Authentication**: Uses vault tokens to securely authenticate with the J-Drive
-
-## Key Features
-
-- Kubernetes-based execution using KubernetesPodOperator
-- Vault-based authentication for J-Drive access
-- Support for file pattern matching
-- Configurable through Airflow variables
-- Error handling and retry logic
-- Email notifications for failures
-
-## Prerequisites
-
-- Kubernetes cluster with Airflow deployed
-- Access to registry for pushing Docker images (`iregistry.dords.kaiser.org`)
-- AWS credentials with S3 read access
-- J-Drive access credentials stored in Vault
-- Airflow connection configured for Kubernetes (`anp-cluster-conn`)
-
-## Files Included
-
-- `s3_to_jdrive_dag.py`: Airflow DAG definition file
-- `Dockerfile`: Container definition for the S3 to J-Drive transfer
-- `run.py`: Python script that handles the data transfer logic
-- `airflow_variables.md`: Documentation of required Airflow variables
-
-## Setup Instructions
-
-### 1. Build and Push the Docker Image
-
-```bash
-# Clone this repository
-git clone <repository-url>
-cd s3-to-jdrive-transfer
-
-# Build the Docker image
-docker build -t iregistry.dords.kaiser.org/s3-jdrive-pod:0.1 .
-
-# Push to registry
-docker push iregistry.dords.kaiser.org/s3-jdrive-pod:0.1
-```
-
-### 2. Configure Airflow Variables
-
-In the Airflow UI, navigate to Admin > Variables and set the following:
-
-- `aws_access_key_id`: AWS access key
-- `aws_secret_access_key`: AWS secret key
-- `aws_region`: AWS region (default: us-west-2)
-- `s3_bucket`: S3 bucket name
-- `s3_prefix`: S3 prefix (folder path)
-- `jdrive_path`: J-Drive path to save files to
-- `file_pattern`: File pattern to match (default: *.json)
-
-See `airflow_variables.md` for detailed information.
-
-### 3. Deploy the DAG
-
-Copy the `s3_to_jdrive_dag.py` file to your Airflow DAGs folder.
-
-### 4. Prepare Authentication Files
-
-Ensure that the vault token and authentication configuration are available at:
-- `/src/vault.token`: Contains the Vault token
-- `/src/auths.json`: Contains J-Drive configuration
-
-The `auths.json` should have the following structure:
-
-```json
-{
-  "JDrive": {
-    "Server": "server-name",
-    "Share": "share-name",
-    "Path": "base/path",
-    "Vault": {
-      "URL": "https://vault-url",
-      "Path": "path/to/credentials",
-      "MountPath": "mount-point"
-    }
-  }
-}
-```
-
-## Usage
-
-Once deployed, the DAG will:
-
-1. Run according to the schedule (default: daily)
-2. Launch the KubernetesPod with the S3 to J-Drive container
-3. Download matching files from S3
-4. Upload them to the specified J-Drive location
-5. Send email notifications on failure
-
-You can also trigger the DAG manually from the Airflow UI.
-
-## Security Considerations
-
-- The solution uses Vault for secure credential management
-- AWS credentials are passed securely via Airflow variables
-- J-Drive credentials are never stored directly in the code or container
-
-## Troubleshooting
-
-- Check Airflow task logs for detailed error messages
-- Verify that vault token and authentication files are accessible
-- Ensure the container has network access to both S3 and J-Drive
-- Check permissions on the J-Drive path
-
-## Similar to Your Existing DAG
-
-This solution follows the same pattern as your existing `viewpoint_pull` DAG:
-- Uses KubernetesPodOperator
-- Mounts volumes for data access
-- Configures resource requirements
-- Sets up appropriate authentication
-- Follows the same task flow structure (start → main_task → complete)
+    main()
