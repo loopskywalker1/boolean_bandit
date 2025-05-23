@@ -1,499 +1,493 @@
-#!/usr/bin/env python3
-"""
-Complete R to Python ML Experiment Translation
-Based on the R code files shown in the screenshots
-"""
+# Simple Federated Prometheus Setup for Rancher with Fleet
 
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from joblib import Parallel, delayed
-import pickle
-import os
-from pathlib import Path
-import gc
-import time
-import warnings
-from tqdm import tqdm
+## Repository Structure in GitLab
 
-warnings.filterwarnings('ignore')
+```
+rancher-prometheus-federation/
+├── README.md
+├── .gitlab-ci.yml
+├── fleet.yaml                    # Fleet configuration
+├── values.yaml                   # Default values
+├── values-dev.yaml              # Dev environment overrides
+├── values-prod.yaml             # Prod environment overrides
+└── version.yaml                 # Version management file
+```
 
-# =============================================================================
-# DATA GENERATING PROCESS (DGP) - Equivalent to dgp.R
-# =============================================================================
+## Step 1: Create Fleet Configuration
 
-# R Code from Image 1-2:
-# set_dgp <- function(dgp_string = "constant") {
-#   if (dgp_string == "constant") {
-#     mu1 <- function(x) { x %*% c(sin(abs(y1)) * pi/10), 3) }
-#     mu0 <- function(x) { sin(abs(y1)) * pi/10 }
-#   } else if (dgp_string == "heterogeneous") {
-#     dgp2 = no = 2
-#     mu1 <- function(x) { x %*% c(sin(abs(y1)) * pi/10)^2 - 5.001031) }
-#     mu0 <- function(x) { sin(abs(y1)) * pi/10 }
-#   }
-# }
+```yaml
+# fleet.yaml
+defaultNamespace: cattle-monitoring-system
 
-class DataGeneratingProcess:
-    """Python equivalent of R's DGP functions"""
+helm:
+  repo: https://charts.rancher.io
+  chart: rancher-monitoring
+  version: 103.0.3+up45.31.1    # This will be managed via version.yaml
+  releaseName: rancher-monitoring
+  valuesFiles:
+    - values.yaml
+  
+diff:
+  comparePatches:
+  - apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingWebhookConfiguration
+    name: rancher-monitoring-admission
+    operations:
+    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
+  - apiVersion: admissionregistration.k8s.io/v1
+    kind: MutatingWebhookConfiguration 
+    name: rancher-monitoring-admission
+    operations:
+    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
+
+targetCustomizations:
+- name: dev
+  clusterSelector:
+    matchLabels:
+      environment: dev
+  helm:
+    valuesFiles:
+    - values.yaml
+    - values-dev.yaml
+
+- name: prod
+  clusterSelector:
+    matchLabels:
+      environment: prod
+  helm:
+    valuesFiles:
+    - values.yaml
+    - values-prod.yaml
+```
+
+## Step 2: Create Base Values File
+
+```yaml
+# values.yaml
+# Rancher Monitoring - Prometheus Federation Configuration
+
+prometheus:
+  prometheusSpec:
+    # Enable federation
+    enableFeatures:
+      - remote-write-receiver
+      - federation
     
-    def __init__(self, dgp_string="constant"):
-        self.dgp_string = dgp_string
-        print(f"Initialized DGP with type: {dgp_string}")
+    # Retention settings
+    retention: 30d
+    retentionSize: "200GB"
     
-    def generate_data(self, n=1000, y_noise=6):
-        """
-        Python equivalent of R's dgp() function
-        Generates synthetic data based on the specified DGP
-        """
-        np.random.seed(42)
-        
-        # Generate covariates (equivalent to R's matrix generation)
-        w1_lbound = -2
-        w1_ubound = 1
-        o_lbound = 0
-        u_ubound = 1
-        
-        # Generate random variables (equivalent to R's runif, rnorm, etc.)
-        w1 = np.random.uniform(w1_lbound, w1_ubound, n)
-        w2 = np.random.normal(0, 3, n)
-        w3 = np.random.uniform(-1, 1, n)
-        w4 = np.random.gamma(2, 2, n)
-        w5 = np.random.gamma(2, 1, n)
-        w6 = np.random.normal(1, 2, n)
-        
-        # Create DataFrame (equivalent to R's tibble)
-        data = pd.DataFrame({
-            'w1': w1, 'w2': w2, 'w3': w3, 'w4': w4, 'w5': w5, 'w6': w6
-        })
-        
-        # Add treatment assignment and outcome generation
-        # This is a simplified version - the R code has complex mu0/mu1 functions
-        if self.dgp_string == "constant":
-            # Simple linear relationship
-            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
-            y1 = w1 + w2 + 2.0 + np.random.normal(0, y_noise, n)  # Treatment effect of 2
-        elif self.dgp_string == "heterogeneous":
-            # Heterogeneous treatment effects
-            treatment_effect = 0.5 + 0.5 * w1 + 0.3 * w2
-            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
-            y1 = y0 + treatment_effect + np.random.normal(0, y_noise, n)
-        else:
-            # Default case
-            y0 = w1 + w2 + np.random.normal(0, y_noise, n)
-            y1 = w1 + w2 + 1.5 + np.random.normal(0, y_noise, n)
-        
-        # Random treatment assignment (equivalent to R's rbinom)
-        a = np.random.binomial(1, 0.5, n)
-        data['a'] = a
-        
-        # Observed outcome (equivalent to R's ifelse)
-        y = np.where(a == 1, y1, y0)
-        data['y'] = y
-        data['y0'] = y0  # Potential outcome under control
-        data['y1'] = y1  # Potential outcome under treatment
-        
-        return data
-
-# =============================================================================
-# CROSS VALIDATION AND MODEL SELECTION - Equivalent to discreteSL.R
-# =============================================================================
-
-# R Code from Images 3-6:
-# get_best_learner <- function(resamples, learners = default_learners, verbose = T) {
-#   if ("prog" %in% names(resamples$splits[[1]]$data)) {
-#     wfs = wf_prog_preproc %>% add_learners(learners)
-#   } else {
-#     wfs = wf_no_prog_preproc %>% add_learners(learners)
-#   }
-#   
-#   fit_learners %>% workflow_map(
-#     resamples = resamples,
-#     metrics = metric_set(yardstick::rmse)
-#   )
-# }
-
-class ModelSelector:
-    """Python equivalent of R's model selection and CV functions"""
+    # Resources
+    resources:
+      requests:
+        cpu: 2000m
+        memory: 4Gi
+      limits:
+        cpu: 4000m
+        memory: 8Gi
     
-    def __init__(self):
-        self.default_learners = self._get_default_learners()
-        
-    def _get_default_learners(self):
-        """
-        Python equivalent of R's default_learners list
-        Based on the learners shown in Images 3-4
-        """
-        return {
-            'knn': KNeighborsRegressor(n_neighbors=5),
-            'linear': LinearRegression(),
-            'gbt': GradientBoostingRegressor(n_estimators=100, random_state=42),
-            'rf': RandomForestRegressor(n_estimators=100, random_state=42),
-            'ridge': Ridge(alpha=1.0),
-            'lasso': Lasso(alpha=0.1)
-        }
+    # Storage with Longhorn
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 300Gi
     
-    def get_best_learner(self, train_data, target_col='y', cv_folds=5, verbose=True):
-        """
-        Python equivalent of R's get_best_learner function
-        Performs cross-validation and selects best model
-        """
-        # Prepare features and target
-        feature_cols = [col for col in train_data.columns if col not in [target_col, 'y0', 'y1']]
-        X = train_data[feature_cols]
-        y = train_data[target_col]
-        
-        # Set up cross-validation (equivalent to R's vfold_cv)
-        cv = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        
-        best_score = float('inf')
-        best_learner = None
-        best_learner_name = None
-        
-        if verbose:
-            print(f"Evaluating {len(self.default_learners)} learners with {cv_folds}-fold CV...")
-        
-        # Evaluate each learner (equivalent to R's workflow_map)
-        for name, learner in self.default_learners.items():
-            try:
-                # Cross-validation with RMSE scoring
-                cv_scores = cross_val_score(
-                    learner, X, y, cv=cv, scoring='neg_mean_squared_error', n_jobs=-1
-                )
-                rmse_scores = np.sqrt(-cv_scores)  # Convert to RMSE
-                mean_rmse = np.mean(rmse_scores)
-                
-                if verbose:
-                    print(f"{name}: RMSE = {mean_rmse:.4f} (+/- {np.std(rmse_scores):.4f})")
-                
-                if mean_rmse < best_score:
-                    best_score = mean_rmse
-                    best_learner = learner
-                    best_learner_name = name
-                    
-            except Exception as e:
-                if verbose:
-                    print(f"Error with {name}: {e}")
-                continue
-        
-        # Fit best learner on full training data
-        best_learner.fit(X, y)
-        
-        return {
-            'model': best_learner,
-            'name': best_learner_name,
-            'rmse': best_score,
-            'feature_cols': feature_cols
-        }
+    # Service configuration for federation
+    service:
+      type: NodePort
+      nodePort: 30090
+    
+    # External labels to identify this Prometheus
+    externalLabels:
+      cluster: "management"
+      prometheus: "rancher-monitoring"
+    
+    # Scrape configs for federation
+    additionalScrapeConfigs:
+      # Federate from cluster Prometheus instances
+      - job_name: 'federate-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{job=~".+"}'  # Adjust this to be more selective
+        static_configs:
+          - targets: []  # Will be populated per environment
 
-# =============================================================================
-# ESTIMATORS - Equivalent to estimators.R
-# =============================================================================
+grafana:
+  enabled: true
+  
+  # Admin credentials - use a secret in production
+  adminPassword: "changeme"
+  
+  # Persistence
+  persistence:
+    enabled: true
+    storageClassName: longhorn
+    size: 20Gi
+  
+  # Service
+  service:
+    type: NodePort
+    nodePort: 30080
+  
+  # Default dashboards
+  defaultDashboardsEnabled: true
+  
+  # Sidecar for loading dashboards
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
 
-# R Code from Images 7-9:
-# unadjusted_estimator <- function(data) {
-#   n = nrow(data)
-#   est_unadj = data %>% { mean(y[a == 1]) - mean(y[a == 0]) }
-#   se_unadj = data %>% { sqrt(2 * (var(y[a == 1]) + var(y[a == 0])) / n) }
-#   return(tibble(effect = est_unadj, se = se_unadj))
-# }
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+  
+  service:
+    type: NodePort
+    nodePort: 30093
 
-class TreatmentEffectEstimators:
-    """Python equivalent of R's estimator functions"""
-    
-    @staticmethod
-    def unadjusted_estimator(data):
-        """
-        Python equivalent of R's unadjusted_estimator
-        Simple difference in means
-        """
-        n = len(data)
-        
-        # Calculate means for treatment and control groups
-        y_treated = data[data['a'] == 1]['y']
-        y_control = data[data['a'] == 0]['y']
-        
-        # Treatment effect estimate (equivalent to R's mean(y[a == 1]) - mean(y[a == 0]))
-        est_unadj = np.mean(y_treated) - np.mean(y_control)
-        
-        # Standard error calculation
-        se_unadj = np.sqrt(2 * (np.var(y_treated) + np.var(y_control)) / n)
-        
-        return {
-            'effect': est_unadj,
-            'se': se_unadj
-        }
-    
-    @staticmethod
-    def tmle_estimator(data, learners=None):
-        """
-        Python equivalent of R's tmle_estimator
-        Simplified TMLE implementation
-        """
-        if learners is None:
-            learners = ModelSelector()._get_default_learners()
-        
-        n = len(data)
-        
-        # Step 1: Estimate propensity scores (simplified)
-        feature_cols = [col for col in data.columns if col not in ['y', 'a', 'y0', 'y1']]
-        X = data[feature_cols]
-        a = data['a']
-        y = data['y']
-        
-        # Estimate propensity score using logistic regression (simplified)
-        from sklearn.linear_model import LogisticRegression
-        prop_model = LogisticRegression()
-        prop_model.fit(X, a)
-        propensity_scores = prop_model.predict_proba(X)[:, 1]
-        
-        # Step 2: Estimate outcome regression
-        outcome_model = LinearRegression()
-        outcome_model.fit(X, y)
-        
-        # Step 3: TMLE update (simplified)
-        # This is a simplified version - full TMLE is more complex
-        y_pred = outcome_model.predict(X)
-        
-        # Calculate influence curve and update
-        clever_covariate = a / propensity_scores - (1 - a) / (1 - propensity_scores)
-        
-        # Simple linear update
-        epsilon_model = LinearRegression()
-        epsilon_model.fit(clever_covariate.reshape(-1, 1), y - y_pred)
-        epsilon = epsilon_model.coef_[0]
-        
-        # Updated predictions
-        y_pred_updated = y_pred + epsilon * clever_covariate
-        
-        # Treatment effect estimate
-        effect_estimate = np.mean(y_pred_updated[a == 1]) - np.mean(y_pred_updated[a == 0])
-        
-        # Standard error (simplified)
-        influence_curve = (a - propensity_scores) * (y - y_pred_updated) / (propensity_scores * (1 - propensity_scores))
-        se_estimate = np.sqrt(np.var(influence_curve) / n)
-        
-        return {
-            'effect': effect_estimate,
-            'se': se_estimate
-        }
+# Disable components we don't need for simplicity
+kubeStateMetrics:
+  enabled: true
 
-# =============================================================================
-# EXPERIMENT RUNNER - Equivalent to experiment.R
-# =============================================================================
+nodeExporter:
+  enabled: true
 
-# R Code from Images 10-12:
-# experiment = function(n_trial, hist_lrnr, y_noise, dgp_string, V) {
-#   registerDoFuture()
-#   plan(multisession)
-#   data_trial = get_trial_dat(n_trial, hist_lrnr, y_noise = y_noise, dgp_string = dgp_string)
-#   # ... complex experiment logic
-# }
+prometheusOperator:
+  enabled: true
+  manageCrds: true
 
-class ExperimentRunner:
-    """Python equivalent of R's experiment functions"""
-    
-    def __init__(self, cache_dir="cache", results_dir="results"):
-        self.cache_dir = Path(cache_dir)
-        self.results_dir = Path(results_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.results_dir.mkdir(exist_ok=True)
-        
-        self.dgp = DataGeneratingProcess()
-        self.model_selector = ModelSelector()
-        self.estimators = TreatmentEffectEstimators()
-    
-    def get_trial_data(self, n_trial, hist_lrnr, y_noise=6, dgp_string="constant", return_m=False):
-        """
-        Python equivalent of R's get_trial_dat function
-        """
-        # Set DGP type
-        self.dgp.dgp_string = dgp_string
-        
-        # Generate trial data
-        if return_m:
-            data_trial = self.dgp.generate_data(n=n_trial, y_noise=y_noise)
-            return data_trial
-        else:
-            data_trial = self.dgp.generate_data(n=n_trial, y_noise=y_noise)
-            
-            # Apply learner predictions if specified
-            if hist_lrnr is not None:
-                feature_cols = hist_lrnr.get('feature_cols', ['w1', 'w2', 'w3', 'w4', 'w5', 'w6'])
-                X_trial = data_trial[feature_cols]
-                
-                # Get predictions from historical learner
-                predictions = hist_lrnr['model'].predict(X_trial)
-                data_trial['prog'] = predictions
-            
-            return data_trial
-    
-    def run_single_experiment(self, n_trial, hist_lrnr, y_noise=6, dgp_string="constant", V=5):
-        """
-        Python equivalent of R's experiment function
-        """
-        # Generate trial data
-        data_trial = self.get_trial_data(n_trial, hist_lrnr, y_noise, dgp_string)
-        
-        # Run different estimators
-        results = {}
-        
-        # Unadjusted estimator
-        unadj_result = self.estimators.unadjusted_estimator(data_trial)
-        results['unadjusted'] = {
-            'effect': unadj_result['effect'],
-            'se': unadj_result['se'],
-            'method': 'unadjusted'
-        }
-        
-        # TMLE estimator (simplified)
-        try:
-            tmle_result = self.estimators.tmle_estimator(data_trial)
-            results['tmle'] = {
-                'effect': tmle_result['effect'],
-                'se': tmle_result['se'],
-                'method': 'tmle'
-            }
-        except Exception as e:
-            print(f"TMLE failed: {e}")
-            results['tmle'] = {
-                'effect': np.nan,
-                'se': np.nan,
-                'method': 'tmle'
-            }
-        
-        # Add experiment metadata
-        for method in results:
-            results[method].update({
-                'n_trial': n_trial,
-                'y_noise': y_noise,
-                'dgp_string': dgp_string,
-                'hist_learner': hist_lrnr['name'] if hist_lrnr else 'none'
-            })
-        
-        return results
+# Disable these for now to keep it simple
+pushgateway:
+  enabled: false
 
-# =============================================================================
-# PARALLEL PROCESSING - Equivalent to cluster.R
-# =============================================================================
+ingressNginx:
+  enabled: false
 
-# R Code from Image 13:
-# cl <- makeClusterPSOCK(workers=workers, rscript_envs=rscript_envs, outfile=outfile)
-# cl <- autoStopCluster(cl)
-# plan(cluster, workers=cl)
+rancherMonitoring:
+  enabled: true
+```
 
-class ParallelRunner:
-    """Python equivalent of R's parallel cluster functions"""
-    
-    def __init__(self, n_workers=None):
-        if n_workers is None:
-            self.n_workers = min(os.cpu_count() - 1, 8)
-        else:
-            self.n_workers = n_workers
-        
-        print(f"Created parallel runner with {self.n_workers} workers")
-    
-    def run_parallel_experiments(self, n_runs=200, n_trials_list=[100, 200, 300, 400, 500], 
-                                dgp_string="constant", y_noise=6):
-        """
-        Python equivalent of R's parallel experiment execution
-        """
-        print(f"Running {n_runs} experiments with {len(n_trials_list)} different sample sizes...")
-        
-        # Initialize experiment runner
-        exp_runner = ExperimentRunner()
-        
-        # Generate historical data for learner training
-        hist_data = exp_runner.dgp.generate_data(n=1000, y_noise=y_noise)
-        hist_train, hist_test = train_test_split(hist_data, test_size=0.3, random_state=42)
-        
-        # Train historical learner
-        print("Training historical learner...")
-        hist_learner = exp_runner.model_selector.get_best_learner(hist_train)
-        print(f"Best historical learner: {hist_learner['name']} (RMSE: {hist_learner['rmse']:.4f})")
-        
-        # Define single experiment function for parallel execution
-        def run_experiment_batch(run_idx):
-            """Function to run one batch of experiments"""
-            np.random.seed(42 + run_idx)  # Ensure reproducibility
-            
-            batch_results = []
-            for n_trial in n_trials_list:
-                result = exp_runner.run_single_experiment(
-                    n_trial=n_trial,
-                    hist_lrnr=hist_learner,
-                    y_noise=y_noise,
-                    dgp_string=dgp_string
-                )
-                
-                # Flatten results for each method
-                for method, method_result in result.items():
-                    method_result['run_idx'] = run_idx
-                    batch_results.append(method_result)
-            
-            return batch_results
-        
-        # Run experiments in parallel
-        print(f"Executing {n_runs} experiment batches in parallel...")
-        all_results = Parallel(n_jobs=self.n_workers, verbose=1)(
-            delayed(run_experiment_batch)(i) for i in tqdm(range(n_runs))
-        )
-        
-        # Flatten results
-        final_results = []
-        for batch_results in all_results:
-            final_results.extend(batch_results)
-        
-        # Convert to DataFrame and save
-        results_df = pd.DataFrame(final_results)
-        
-        # Save results
-        results_file = exp_runner.results_dir / f"experiment_results_{dgp_string}.parquet"
-        results_df.to_parquet(results_file)
-        
-        print(f"\nExperiment completed!")
-        print(f"Results saved to: {results_file}")
-        print(f"Total experiments: {len(final_results)}")
-        print(f"Mean treatment effect (unadjusted): {results_df[results_df['method'] == 'unadjusted']['effect'].mean():.4f}")
-        
-        return results_df
+## Step 3: Environment-Specific Values
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
+```yaml
+# values-dev.yaml
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 7d
+    retentionSize: "50GB"
+    
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 100Gi
+    
+    # Dev cluster federation targets
+    additionalScrapeConfigs:
+      - job_name: 'federate-dev-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{__name__=~"node_.*"}'
+            - '{__name__=~"kube_.*"}'
+            - '{__name__=~"container_.*"}'
+        static_configs:
+          - targets:
+            - 'dev-cluster-1.local:30090'
+            - 'dev-cluster-2.local:30090'
 
-def main():
-    """Main function to run the complete experiment pipeline"""
-    print("=== Python ML Experiment Pipeline ===")
-    print("Translated from R code")
-    
-    start_time = time.time()
-    
-    # Initialize parallel runner
-    runner = ParallelRunner(n_workers=4)
-    
-    # Run experiments
-    results = runner.run_parallel_experiments(
-        n_runs=50,  # Reduced for testing - increase to 200 for full run
-        n_trials_list=[100, 200, 300, 400, 500],
-        dgp_string="constant",
-        y_noise=6
-    )
-    
-    # Print summary statistics
-    print("\n=== Summary Statistics ===")
-    summary = results.groupby(['method', 'n_trial'])['effect'].agg(['mean', 'std', 'count'])
-    print(summary)
-    
-    elapsed_time = time.time() - start_time
-    print(f"\nTotal execution time: {elapsed_time:.2f} seconds")
+grafana:
+  adminPassword: "devpassword"  # Change this!
+```
 
-if __name__ == "__main__":
-    main()
+```yaml
+# values-prod.yaml
+prometheus:
+  prometheusSpec:
+    replicas: 2
+    retention: 30d
+    retentionSize: "500GB"
+    
+    # HA configuration
+    replicaExternalLabelName: "prometheus_replica"
+    prometheusExternalLabelName: "prometheus"
+    
+    # Production federation targets
+    additionalScrapeConfigs:
+      - job_name: 'federate-prod-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{__name__=~"node_.*"}'
+            - '{__name__=~"kube_.*"}'
+            - '{__name__=~"container_.*"}'
+            - '{__name__=~"up"}'
+        static_configs:
+          - targets:
+            - 'prod-cluster-1.local:30090'
+            - 'prod-cluster-2.local:30090'
+            - 'prod-cluster-3.local:30090'
+
+grafana:
+  adminPassword: "prodpassword"  # Use a secret!
+  
+  # Additional production settings
+  ingress:
+    enabled: false  # Using NodePort as specified
+```
+
+## Step 4: Version Management File
+
+```yaml
+# version.yaml
+# This file manages the Helm chart version
+# Update this when you want to upgrade the monitoring stack
+
+rancher_monitoring:
+  chart_version: "103.0.3+up45.31.1"
+  app_version: "v0.65.1"
+  
+# Version history for rollback reference
+version_history:
+  - version: "103.0.3+up45.31.1"
+    date: "2024-01-15"
+    notes: "Initial deployment"
+  - version: "102.0.2+up40.1.2"
+    date: "2023-12-01"
+    notes: "Previous stable version"
+```
+
+## Step 5: GitLab CI/CD Pipeline
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - validate
+  - update-version
+  - deploy
+
+variables:
+  GIT_STRATEGY: clone
+  FLEET_NAMESPACE: fleet-default
+
+# Validate Helm values
+validate:
+  stage: validate
+  image: alpine/helm:latest
+  script:
+    - echo "Validating Helm values files..."
+    - helm lint . || true
+    - echo "Checking YAML syntax..."
+    - |
+      for file in *.yaml; do
+        echo "Validating $file"
+        cat $file | yaml lint - || exit 1
+      done
+  only:
+    - merge_requests
+    - main
+
+# Update Fleet configuration with new version
+update-version:
+  stage: update-version
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yq git
+  script:
+    - |
+      # Extract version from version.yaml
+      CHART_VERSION=$(yq eval '.rancher_monitoring.chart_version' version.yaml)
+      echo "Chart version: $CHART_VERSION"
+      
+      # Update fleet.yaml with new version
+      yq eval -i ".helm.version = \"$CHART_VERSION\"" fleet.yaml
+      
+      # Commit if changed
+      if [[ $(git status --porcelain) ]]; then
+        git config user.email "ci@example.com"
+        git config user.name "GitLab CI"
+        git add fleet.yaml
+        git commit -m "Update rancher-monitoring to version $CHART_VERSION"
+      fi
+  only:
+    - main
+  artifacts:
+    paths:
+      - fleet.yaml
+
+# Deploy to Rancher using Fleet
+deploy:
+  stage: deploy
+  image: rancher/kubectl:v1.27.0
+  script:
+    - |
+      # Create or update Fleet GitRepo
+      cat <<EOF | kubectl apply -f -
+      apiVersion: fleet.cattle.io/v1alpha1
+      kind: GitRepo
+      metadata:
+        name: prometheus-federation
+        namespace: ${FLEET_NAMESPACE}
+      spec:
+        repo: ${CI_PROJECT_URL}.git
+        branch: ${CI_COMMIT_REF_NAME}
+        clientSecretName: gitlab-secret
+        paths:
+        - .
+        targets:
+        - name: management
+          clusterSelector:
+            matchLabels:
+              management: "true"
+      EOF
+      
+      # Wait for deployment
+      echo "Waiting for Fleet to sync..."
+      kubectl -n ${FLEET_NAMESPACE} wait --for=condition=Ready gitrepo/prometheus-federation --timeout=300s
+  only:
+    - main
+  when: manual
+```
+
+## Step 6: Setup Instructions
+
+### 1. Create GitLab Repository
+
+```bash
+# Initialize your GitLab repository
+git init rancher-prometheus-federation
+cd rancher-prometheus-federation
+
+# Create all the files above
+touch fleet.yaml values.yaml values-dev.yaml values-prod.yaml version.yaml .gitlab-ci.yml README.md
+
+# Copy the content into each file
+
+# Initial commit
+git add .
+git commit -m "Initial Prometheus federation setup"
+git remote add origin https://gitlab.com/your-org/rancher-prometheus-federation.git
+git push -u origin main
+```
+
+### 2. Create GitLab Secret in Rancher
+
+```bash
+# Create secret for Fleet to access GitLab
+kubectl create secret generic gitlab-secret \
+  -n fleet-default \
+  --from-literal=username=<gitlab-username> \
+  --from-literal=password=<gitlab-token>
+```
+
+### 3. Label Your Clusters
+
+```bash
+# Label your management cluster
+kubectl label cluster <cluster-name> management=true
+
+# Label environment clusters
+kubectl label cluster <dev-cluster> environment=dev
+kubectl label cluster <prod-cluster> environment=prod
+```
+
+### 4. Deploy Using Fleet
+
+```bash
+# Apply the GitRepo to trigger Fleet deployment
+kubectl apply -f - <<EOF
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: prometheus-federation
+  namespace: fleet-default
+spec:
+  repo: https://gitlab.com/your-org/rancher-prometheus-federation.git
+  branch: main
+  clientSecretName: gitlab-secret
+  paths:
+  - .
+  targets:
+  - name: management
+    clusterSelector:
+      matchLabels:
+        management: "true"
+EOF
+```
+
+## Step 7: Updating Versions
+
+When you want to update to a new version of rancher-monitoring:
+
+1. **Check available versions:**
+   ```bash
+   helm search repo rancher/rancher-monitoring --versions
+   ```
+
+2. **Update version.yaml:**
+   ```yaml
+   rancher_monitoring:
+     chart_version: "103.0.4+up45.31.2"  # New version
+     app_version: "v0.65.2"
+   ```
+
+3. **Commit and push:**
+   ```bash
+   git add version.yaml
+   git commit -m "Update rancher-monitoring to 103.0.4+up45.31.2"
+   git push
+   ```
+
+4. **GitLab CI will automatically update fleet.yaml and Fleet will deploy**
+
+## Access Your Monitoring
+
+After deployment:
+- **Prometheus**: `http://<any-node-ip>:30090`
+- **Grafana**: `http://<any-node-ip>:30080`
+- **Alertmanager**: `http://<any-node-ip>:30093`
+
+## Next Steps
+
+Once this is working, you can:
+1. Add federation targets for your other clusters
+2. Create custom Grafana dashboards
+3. Set up alerting rules
+4. Add authentication/security
+
+This setup gives you a simple, maintainable way to deploy federated Prometheus with version control through GitLab and automated deployment through Fleet.
