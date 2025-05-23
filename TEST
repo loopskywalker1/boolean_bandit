@@ -1,162 +1,130 @@
 #!/usr/bin/env python3
 """
-GPU-Optimized Causal Inference Monte Carlo Simulation
-Based on your existing Python implementation with A100 GPU optimizations
+Simplified GPU-Optimized Causal Inference Monte Carlo Simulation
+=================================================================
+This code performs Monte Carlo simulations for causal inference experiments
+with support for GPU acceleration on NVIDIA A100 or similar GPUs.
+
+Key Features:
+- Generates synthetic data with known treatment effects
+- Trains multiple ML models using cross-validation
+- Runs parallel Monte Carlo experiments
+- Supports both CPU and GPU execution
+- Saves results in Parquet format for analysis
 """
 
 import os
 import numpy as np
 import pandas as pd
 import time
-import datetime
 import logging
 from pathlib import Path
-import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from itertools import product
-import pickle
 import warnings
+warnings.filterwarnings('ignore')
 
-# GPU Libraries (install with: pip install cupy-cuda11x cudf-cu11 cuml-cu11)
+# ===== GPU SUPPORT (OPTIONAL) =====
+# Try to import GPU libraries - if not available, fall back to CPU
 try:
     import cupy as cp
     import cudf
-    import cuml
     from cuml.ensemble import RandomForestRegressor as CuRandomForestRegressor
-    from cuml.linear_model import LinearRegression as CuLinearRegression, Ridge as CuRidge, Lasso as CuLasso
+    from cuml.linear_model import Ridge as CuRidge, Lasso as CuLasso
     from cuml.neighbors import KNeighborsRegressor as CuKNeighborsRegressor
     GPU_AVAILABLE = True
-    print("GPU libraries loaded successfully")
+    print("✓ GPU libraries loaded - will use GPU acceleration")
 except ImportError:
     GPU_AVAILABLE = False
-    print("GPU libraries not available, falling back to CPU")
+    print("✗ GPU libraries not available - will use CPU only")
 
-# Standard ML libraries
+# ===== STANDARD ML LIBRARIES =====
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_squared_error
-import xgboost as xgb
 import pyarrow.parquet as pq
 import pyarrow as pa
 from tqdm import tqdm
 
-warnings.filterwarnings('ignore')
+# ===== LOGGING SETUP =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# =============================================================================
-# GPU CONFIGURATION
-# =============================================================================
 
-def setup_gpu():
-    """Configure GPU environment for optimal A100 performance."""
-    print("=== GPU Setup ===")
+class DataGenerator:
+    """
+    Generates synthetic data for causal inference experiments.
     
-    if not GPU_AVAILABLE:
-        print("GPU not available, using CPU")
-        return False
-    
-    try:
-        # Check GPU availability
-        gpu_count = cp.cuda.runtime.getDeviceCount()
-        print(f"Found {gpu_count} GPU(s)")
-        
-        if gpu_count > 0:
-            # Use the first GPU (A100)
-            cp.cuda.Device(0).use()
-            mempool = cp.get_default_memory_pool()
-            mempool.set_limit(size=2**34)  # 16GB limit for safety
-            
-            # Get GPU info
-            device = cp.cuda.Device(0)
-            print(f"Using GPU: {device}")
-            print(f"GPU Memory: {cp.cuda.runtime.memGetInfo()[1] / 1e9:.1f} GB total")
-            
-            return True
-    except Exception as e:
-        print(f"GPU setup failed: {e}")
-        return False
-    
-    return False
-
-# =============================================================================
-# ENHANCED DATA GENERATING PROCESS
-# =============================================================================
-
-class GPUDataGenerator:
-    """GPU-accelerated data generation for causal inference."""
+    This class creates datasets with:
+    - 6 covariates (W1-W6) drawn from uniform[-1, 1]
+    - Binary treatment assignment (A) with 50% probability
+    - Potential outcomes (Y0, Y1) based on covariates
+    - Observed outcome (Y) based on treatment assignment
+    """
     
     def __init__(self, use_gpu=True):
+        """
+        Initialize data generator.
+        
+        Args:
+            use_gpu: Whether to use GPU acceleration if available
+        """
         self.use_gpu = use_gpu and GPU_AVAILABLE
+        # Use CuPy (GPU) or NumPy (CPU) based on availability
         self.xp = cp if self.use_gpu else np
         
-    def set_dgp(self, dgp_string):
-        """Set the data generating process functions."""
+    def generate_data(self, n, y_noise=6, dgp_type="dgp3", seed=None):
+        """
+        Generate synthetic causal inference data.
         
-        def mu0_constant(X):
-            return self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10 - 3
-        
-        def mu1_constant(X):
-            return self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10
-        
-        def mu0_heterogeneous(X):
-            return self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10 ** 2 - 30.00103
-        
-        def mu1_heterogeneous(X):
-            return self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10
-        
-        def mu0_dgp3(X):
-            return (X[:, 0]**2 + 
-                   2.4 * X[:, 2] + 
-                   X[:, 4] - 
-                   self.xp.sqrt(self.xp.abs(X[:, 0])))
-        
-        def mu1_dgp3(X):
-            return (X[:, 0]**2 + 
-                   2*X[:, 1] - 
-                   0.2 * X[:, 2] + 
-                   X[:, 4] - 
-                   self.xp.sqrt(self.xp.abs(X[:, 0])))
-        
-        dgp_functions = {
-            'constant': (mu0_constant, mu1_constant),
-            'heterogeneous': (mu0_heterogeneous, mu1_heterogeneous),
-            'dgp3': (mu0_dgp3, mu1_dgp3)
-        }
-        
-        return dgp_functions.get(dgp_string, dgp_functions['dgp3'])
-    
-    def dgp(self, n, y_noise=6, dgp_string="dgp3", rng=None):
-        """Generate synthetic causal inference data on GPU."""
-        if rng is None:
+        Args:
+            n: Number of observations to generate
+            y_noise: Standard deviation of outcome noise
+            dgp_type: Data generating process type ("constant", "heterogeneous", "dgp3")
+            seed: Random seed for reproducibility
+            
+        Returns:
+            DataFrame with columns: W1-W6, A, Y, Y0, Y1
+        """
+        # Set random seed if provided
+        if seed is not None:
             if self.use_gpu:
-                # Use CuPy's random state
-                rng_state = cp.random.get_random_state()
+                cp.random.seed(seed)
             else:
-                rng_state = np.random.RandomState()
-        else:
-            rng_state = rng
+                np.random.seed(seed)
         
-        # Generate covariates uniformly between -1 and 1
+        # Generate 6 covariates uniformly between -1 and 1
         if self.use_gpu:
-            X = rng_state.uniform(-1, 1, size=(n, 5))
+            X = cp.random.uniform(-1, 1, size=(n, 6))
         else:
-            X = rng_state.uniform(-1, 1, size=(n, 5))
+            X = np.random.uniform(-1, 1, size=(n, 6))
         
-        # Get DGP functions
-        mu0_func, mu1_func = self.set_dgp(dgp_string)
+        # Calculate potential outcomes based on DGP type
+        Y0, Y1 = self._calculate_potential_outcomes(X, dgp_type)
         
-        # Generate potential outcomes with noise
-        Y0 = mu0_func(X) + rng_state.normal(0, y_noise, n)
-        Y1 = mu1_func(X) + rng_state.normal(0, y_noise, n)
+        # Add noise to potential outcomes
+        if self.use_gpu:
+            Y0 += cp.random.normal(0, y_noise, n)
+            Y1 += cp.random.normal(0, y_noise, n)
+        else:
+            Y0 += np.random.normal(0, y_noise, n)
+            Y1 += np.random.normal(0, y_noise, n)
         
         # Randomly assign treatment with 50% probability
-        A = rng_state.binomial(1, 0.5, n)
+        if self.use_gpu:
+            A = cp.random.binomial(1, 0.5, n)
+        else:
+            A = np.random.binomial(1, 0.5, n)
         
-        # Observed outcome depends on treatment assignment
+        # Observed outcome depends on treatment
+        # Y = Y1 if treated (A=1), Y0 if control (A=0)
         Y = A * Y1 + (1 - A) * Y0
         
-        # Convert to CPU if using GPU for easier DataFrame creation
+        # Convert GPU arrays to CPU for DataFrame creation
         if self.use_gpu:
             X = cp.asnumpy(X)
             Y = cp.asnumpy(Y)
@@ -164,452 +132,432 @@ class GPUDataGenerator:
             Y1 = cp.asnumpy(Y1)
             A = cp.asnumpy(A)
         
-        # Create DataFrame
+        # Create DataFrame with all variables
         data = pd.DataFrame({
-            'W1': X[:, 0], 'W2': X[:, 1], 'W3': X[:, 2], 'W4': X[:, 3], 'W5': X[:, 4],
+            'W1': X[:, 0], 'W2': X[:, 1], 'W3': X[:, 2],
+            'W4': X[:, 3], 'W5': X[:, 4], 'W6': X[:, 5],
             'A': A, 'Y': Y, 'Y0': Y0, 'Y1': Y1
         })
         
         return data
+    
+    def _calculate_potential_outcomes(self, X, dgp_type):
+        """
+        Calculate potential outcomes Y0 and Y1 based on covariates.
+        
+        Different DGP types create different relationships between
+        covariates and potential outcomes, allowing us to test
+        estimator performance under various scenarios.
+        """
+        if dgp_type == "constant":
+            # Constant treatment effect
+            Y0 = self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10 - 3
+            Y1 = self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10
+            
+        elif dgp_type == "heterogeneous":
+            # Heterogeneous treatment effect
+            Y0 = self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10 ** 2 - 30.00103
+            Y1 = self.xp.sin(self.xp.abs(X[:, 0])) * self.xp.pi/10
+            
+        else:  # dgp3 (default)
+            # Complex non-linear relationships
+            Y0 = (X[:, 0]**2 + 
+                  2.4 * X[:, 2] + 
+                  X[:, 4] + 
+                  0.5 * X[:, 5] - 
+                  self.xp.sqrt(self.xp.abs(X[:, 0])))
+            
+            Y1 = (X[:, 0]**2 + 
+                  2 * X[:, 1] - 
+                  0.2 * X[:, 2] + 
+                  X[:, 4] + 
+                  0.5 * X[:, 5] - 
+                  self.xp.sqrt(self.xp.abs(X[:, 0])))
+        
+        return Y0, Y1
 
-# =============================================================================
-# ENHANCED MODEL SELECTION WITH GPU SUPPORT
-# =============================================================================
 
-class GPUModelSelector:
-    """GPU-accelerated model selection for causal inference."""
+class ModelSelector:
+    """
+    Selects best predictive model using cross-validation.
+    
+    This class implements a simplified Super Learner approach:
+    1. Trains multiple candidate models
+    2. Evaluates each using k-fold cross-validation
+    3. Selects the model with lowest RMSE
+    """
     
     def __init__(self, use_gpu=True):
+        """Initialize model selector with GPU support if available."""
         self.use_gpu = use_gpu and GPU_AVAILABLE
         
-    def get_candidate_learners(self):
-        """Get candidate models with GPU support when available."""
+    def get_candidate_models(self):
+        """
+        Get dictionary of candidate models.
+        
+        Returns both GPU and CPU versions when GPU is available,
+        otherwise just CPU versions.
+        """
         models = {}
         
+        # GPU models (if available)
         if self.use_gpu:
             try:
-                # GPU models
                 models.update({
-                    'lasso_gpu': CuLasso(alpha=0.01, max_iter=10000),
-                    'enet_gpu': CuLinearRegression(),  # CuML doesn't have ElasticNet, use LinearRegression
                     'ridge_gpu': CuRidge(alpha=1.0),
-                    'rf_gpu': CuRandomForestRegressor(n_estimators=200, min_samples_leaf=5, n_jobs=-1),
-                    'knn_gpu': CuKNeighborsRegressor(n_neighbors=5)
+                    'lasso_gpu': CuLasso(alpha=0.01),
+                    'rf_gpu': CuRandomForestRegressor(
+                        n_estimators=100,
+                        max_depth=10,
+                        random_state=42
+                    ),
+                    'knn_gpu': CuKNeighborsRegressor(n_neighbors=10)
                 })
+                logger.info("Added GPU models to candidate set")
             except Exception as e:
-                print(f"GPU models failed to initialize: {e}")
+                logger.warning(f"Could not initialize GPU models: {e}")
         
-        # CPU models (always available as fallback)
+        # CPU models (always available)
         models.update({
-            'lasso': Lasso(alpha=0.01, max_iter=10000),
-            'enet': ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=10000),
             'ridge': Ridge(alpha=1.0),
-            'rf': RandomForestRegressor(n_estimators=200, min_samples_leaf=5, n_jobs=-1),
-            'gbm': GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=3),
-            'knn': KNeighborsRegressor(n_neighbors=5)
+            'lasso': Lasso(alpha=0.01, max_iter=5000),
+            'elastic': ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+            'rf': RandomForestRegressor(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_leaf=5,
+                random_state=42,
+                n_jobs=-1
+            ),
+            'gbm': GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42
+            ),
+            'knn': KNeighborsRegressor(n_neighbors=10)
         })
-        
-        # Add XGBoost with GPU support if available
-        if self.use_gpu:
-            try:
-                models['xgb_gpu'] = xgb.XGBRegressor(
-                    n_estimators=500,
-                    learning_rate=0.05,
-                    max_depth=6,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    tree_method='gpu_hist',
-                    gpu_id=0
-                )
-            except:
-                pass
-        
-        models['xgb'] = xgb.XGBRegressor(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            n_jobs=-1
-        )
         
         return models
     
-    def fit_prog(self, train_dat, v=10, learners=None, rng=None):
-        """SuperLearner-style model selection via cross-validation."""
-        if rng is None:
-            rng = np.random.RandomState()
+    def select_best_model(self, train_data, cv_folds=10):
+        """
+        Select best model using cross-validation.
         
-        if learners is None:
-            learners = self.get_candidate_learners()
+        Args:
+            train_data: Training DataFrame with features W1-W6 and outcome Y
+            cv_folds: Number of cross-validation folds
+            
+        Returns:
+            Tuple of (model_name, fitted_model, cv_rmse)
+        """
+        # Extract features and outcome
+        X = train_data[['W1', 'W2', 'W3', 'W4', 'W5', 'W6']]
+        y = train_data['Y']
         
-        # Extract features and target
-        X = train_dat.filter(like='W')
-        y = train_dat['Y']
+        # Get candidate models
+        models = self.get_candidate_models()
         
-        # Convert to GPU arrays if using GPU
-        if self.use_gpu and any('_gpu' in name for name in learners.keys()):
+        # Evaluate each model using cross-validation
+        cv_results = {}
+        kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        
+        logger.info(f"Evaluating {len(models)} models with {cv_folds}-fold CV...")
+        
+        for name, model in models.items():
             try:
-                X_gpu = cudf.from_pandas(X)
-                y_gpu = cudf.Series(y)
-            except:
-                X_gpu, y_gpu = X, y
-        
-        # Setup cross-validation
-        cv = KFold(n_splits=v, shuffle=True, random_state=rng.randint(1e9))
-        cv_scores = {}
-        
-        for name, model in learners.items():
-            try:
-                logger.debug(f"Cross-validating {name}")
-                
-                # Use GPU data for GPU models
-                if self.use_gpu and '_gpu' in name and 'X_gpu' in locals():
-                    # For CuML models, we need to handle CV differently
+                # Handle GPU models differently
+                if self.use_gpu and '_gpu' in name:
+                    # Manual CV for GPU models
                     scores = []
-                    for train_idx, val_idx in cv.split(X):
-                        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+                    for train_idx, val_idx in kf.split(X):
+                        # Split data
+                        X_train = X.iloc[train_idx]
+                        X_val = X.iloc[val_idx]
+                        y_train = y.iloc[train_idx]
+                        y_val = y.iloc[val_idx]
                         
-                        # Convert to CuDF
+                        # Convert to GPU format
                         X_train_gpu = cudf.from_pandas(X_train)
                         y_train_gpu = cudf.Series(y_train.values)
                         X_val_gpu = cudf.from_pandas(X_val)
-                        y_val_gpu = cudf.Series(y_val.values)
                         
+                        # Fit and predict
                         model.fit(X_train_gpu, y_train_gpu)
-                        pred = model.predict(X_val_gpu)
-                        mse = cp.mean((y_val_gpu.values - pred) ** 2)
-                        scores.append(-float(mse))  # Negative MSE
+                        y_pred = model.predict(X_val_gpu)
+                        
+                        # Calculate RMSE
+                        if hasattr(y_pred, 'values'):
+                            y_pred = y_pred.values
+                        mse = np.mean((y_val.values - cp.asnumpy(y_pred))**2)
+                        scores.append(np.sqrt(mse))
                     
-                    cv_scores[name] = np.mean(scores)
+                    cv_rmse = np.mean(scores)
+                    
                 else:
-                    # Standard CPU cross-validation
+                    # Standard sklearn cross-validation for CPU models
                     scores = cross_val_score(
                         model, X, y,
+                        cv=kf,
                         scoring='neg_root_mean_squared_error',
-                        cv=cv,
-                        n_jobs=1  # Already parallel at outer level
+                        n_jobs=1
                     )
-                    cv_scores[name] = scores.mean()
+                    cv_rmse = -scores.mean()
                 
-                logger.debug(f"{name} CV RMSE: {-cv_scores[name]:.4f}")
+                cv_results[name] = cv_rmse
+                logger.debug(f"{name}: CV RMSE = {cv_rmse:.4f}")
                 
             except Exception as e:
-                logger.error(f"Error in {name} CV: {e}")
-                cv_scores[name] = float('-inf')
+                logger.error(f"Error evaluating {name}: {e}")
+                cv_results[name] = float('inf')
         
-        if not cv_scores:
-            raise RuntimeError("All learners failed during cross-validation")
+        # Select best model (lowest RMSE)
+        best_name = min(cv_results, key=cv_results.get)
+        best_rmse = cv_results[best_name]
         
-        # Find best learner
-        best_learner_name = max(cv_scores, key=cv_scores.get)
-        best_cv_rmse = -cv_scores[best_learner_name]
+        logger.info(f"Best model: {best_name} (CV RMSE: {best_rmse:.4f})")
         
-        logger.info(f"Best learner: {best_learner_name} (CV RMSE: {best_cv_rmse:.4f})")
-        
-        # Fit best model on all training data
-        best_model = learners[best_learner_name]
-        
-        if self.use_gpu and '_gpu' in best_learner_name:
-            try:
-                X_gpu = cudf.from_pandas(X)
-                y_gpu = cudf.Series(y.values)
-                best_model.fit(X_gpu, y_gpu)
-            except:
-                best_model.fit(X, y)
+        # Refit best model on all training data
+        best_model = models[best_name]
+        if self.use_gpu and '_gpu' in best_name:
+            X_gpu = cudf.from_pandas(X)
+            y_gpu = cudf.Series(y.values)
+            best_model.fit(X_gpu, y_gpu)
         else:
             best_model.fit(X, y)
         
-        return best_learner_name, best_model, best_cv_rmse
+        return best_name, best_model, best_rmse
 
-# =============================================================================
-# ENHANCED EXPERIMENT FUNCTION
-# =============================================================================
 
-def experiment(n_trials, prog_model, y_noise, dgp_string, rng=None):
-    """Run one experiment for a given parameter set with GPU acceleration."""
-    if rng is None:
-        rng = np.random.RandomState()
+def run_single_experiment(params):
+    """
+    Run a single experiment iteration.
     
-    # Initialize GPU data generator
-    data_gen = GPUDataGenerator(use_gpu=GPU_AVAILABLE)
+    This function:
+    1. Generates new trial data
+    2. Makes predictions using the trained model
+    3. Calculates performance metrics
+    4. Returns results dictionary
+    """
+    # Unpack parameters
+    n_trials = params['n_trials']
+    model_info = params['model_info']
+    y_noise = params['y_noise']
+    dgp_type = params['dgp_type']
+    iteration = params['iteration']
+    seed = params['seed']
     
-    # Generate a new dataset with n_trials samples
-    trial_data = data_gen.dgp(n=n_trials, y_noise=y_noise, dgp_string=dgp_string, rng=rng)
+    # Set seed for this iteration
+    iter_seed = seed + iteration if seed else None
     
-    # Extract features for prediction
-    X_trial = trial_data.filter(like='W')
-    y_true = trial_data['Y']
+    # Generate trial data
+    data_gen = DataGenerator(use_gpu=GPU_AVAILABLE)
+    trial_data = data_gen.generate_data(
+        n=n_trials,
+        y_noise=y_noise,
+        dgp_type=dgp_type,
+        seed=iter_seed
+    )
     
-    # Predict with prognostic model
-    best_learner_name, fitted_model, _ = prog_model
+    # Extract model components
+    model_name, fitted_model, cv_rmse = model_info
+    
+    # Make predictions
+    X_trial = trial_data[['W1', 'W2', 'W3', 'W4', 'W5', 'W6']]
     
     try:
-        if GPU_AVAILABLE and '_gpu' in best_learner_name:
-            try:
-                X_trial_gpu = cudf.from_pandas(X_trial)
-                y_pred = fitted_model.predict(X_trial_gpu)
-                if hasattr(y_pred, 'values'):
-                    y_pred = y_pred.values
-                y_pred = cp.asnumpy(y_pred) if isinstance(y_pred, cp.ndarray) else y_pred
-            except:
-                y_pred = fitted_model.predict(X_trial)
+        if GPU_AVAILABLE and '_gpu' in model_name:
+            X_trial_gpu = cudf.from_pandas(X_trial)
+            y_pred = fitted_model.predict(X_trial_gpu)
+            if hasattr(y_pred, 'values'):
+                y_pred = cp.asnumpy(y_pred.values)
+            else:
+                y_pred = cp.asnumpy(y_pred)
         else:
             y_pred = fitted_model.predict(X_trial)
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
         y_pred = np.zeros(len(X_trial))
     
-    # Calculate performance metrics
+    # Calculate metrics
+    y_true = trial_data['Y']
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    bias = np.mean(y_pred - y_true)
-    var_pred = np.var(y_pred)
     
-    # Calculate true and estimated treatment effects
+    # Calculate treatment effects
     true_ate = trial_data['Y1'].mean() - trial_data['Y0'].mean()
     
     # Simple difference in means estimator
-    treated_mean = trial_data.loc[trial_data['A'] == 1, 'Y'].mean()
-    control_mean = trial_data.loc[trial_data['A'] == 0, 'Y'].mean()
-    naive_ate = treated_mean - control_mean
+    treated_outcomes = trial_data.loc[trial_data['A'] == 1, 'Y']
+    control_outcomes = trial_data.loc[trial_data['A'] == 0, 'Y']
+    estimated_ate = treated_outcomes.mean() - control_outcomes.mean()
     
+    # Return results
     return {
+        'iteration': iteration,
         'n_trials': n_trials,
-        'rmse': rmse,
-        'bias': bias,
-        'var_pred': var_pred,
+        'model': model_name,
+        'cv_rmse': cv_rmse,
+        'test_rmse': rmse,
         'true_ate': true_ate,
-        'naive_ate': naive_ate
+        'estimated_ate': estimated_ate,
+        'ate_bias': estimated_ate - true_ate,
+        'n_treated': len(treated_outcomes),
+        'n_control': len(control_outcomes)
     }
 
-# =============================================================================
-# PARALLEL EXPERIMENT RUNNER
-# =============================================================================
-
-def run_experiment(run_index):
-    """Run a full Monte Carlo repetition across parameter grid."""
-    worker_id = os.getpid()
-    logger.info(f"Worker {worker_id} starting run {run_index}")
-    
-    # Create worker-specific RNG with unique seed derived from experimental_seed
-    run_rng = np.random.RandomState(EXPERIMENT_SEED + run_index)
-    
-    try:
-        results = []
-        for n_trials in PARAM_GRID['n_trials']:
-            # Call experiment with this parameter setting
-            result = experiment(
-                n_trials=n_trials,
-                prog_model=prog_model,  # Using the global prog_model
-                y_noise=Y_NOISE,
-                dgp_string=DGP_STRING,
-                rng=run_rng
-            )
-            
-            # Add run index and seed for traceability
-            result['run'] = run_index
-            result['seed'] = EXPERIMENT_SEED
-            
-            results.append(result)
-        
-        # Combine all parameter results into a DataFrame
-        result_df = pd.DataFrame(results)
-        
-        # Create output filename like in R
-        output_filename = f"experiment_result_run_{run_index}.parquet"
-        output_path = EXP_DIR / output_filename
-        
-        # Write to parquet file
-        table = pa.Table.from_pandas(result_df)
-        pq.write_table(table, output_path)
-        
-        logger.info(f"Worker {worker_id} completed run {run_index}")
-        return output_filename
-        
-    except Exception as e:
-        logger.error(f"Worker {worker_id} error in run {run_index}: {str(e)}", exc_info=True)
-        return None
-
-# =============================================================================
-# ENHANCED MAIN FUNCTION
-# =============================================================================
 
 def main():
-    """Main function with GPU optimization and parallel processing."""
-    global prog_model, sig3, best_learner_name, kappa3  # Make these global for multiprocessing
+    """
+    Main function to orchestrate the Monte Carlo simulation.
     
-    logger.info(f"Starting simulation with {N_RUNS} runs on {N_WORKERS} workers")
-    logger.info(f"DGP: {DGP_STRING}, Noise: {Y_NOISE}, CV Folds: {CV_FOLDS}")
+    This function:
+    1. Sets up the experiment parameters
+    2. Generates historical data for model training
+    3. Selects the best predictive model
+    4. Runs multiple experiment iterations in parallel
+    5. Saves results to disk
+    """
     
-    # Setup GPU
-    gpu_enabled = setup_gpu()
-    logger.info(f"GPU acceleration: {'Enabled' if gpu_enabled else 'Disabled'}")
+    # ===== EXPERIMENT CONFIGURATION =====
+    # These parameters control the simulation
+    CONFIG = {
+        'dgp_type': 'dgp3',           # Data generating process
+        'n_hist': 2000,               # Historical data size for training
+        'y_noise': 6,                 # Outcome noise level
+        'cv_folds': 10,               # Cross-validation folds
+        'n_iterations': 200,          # Number of MC iterations
+        'n_trials_list': [100, 200, 300, 400, 500],  # Sample sizes to test
+        'n_workers': min(8, os.cpu_count()),  # Parallel workers
+        'seed': 42                    # Random seed
+    }
     
-    # Generate historical data
-    logger.info(f"Generating historical data (n={N_HIST})...")
-    data_gen = GPUDataGenerator(use_gpu=gpu_enabled)
-    hist_train, hist_test = get_hist_dat(
-        n_hist=N_HIST,
-        y_noise=Y_NOISE,
-        dgp_string=DGP_STRING,
-        rng=MAIN_RNG
+    # Create output directory
+    output_dir = Path('results') / CONFIG['dgp_type']
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info("="*60)
+    logger.info("CAUSAL INFERENCE MONTE CARLO SIMULATION")
+    logger.info("="*60)
+    logger.info(f"Configuration: {CONFIG}")
+    
+    # ===== STEP 1: GENERATE HISTORICAL DATA =====
+    logger.info("\nStep 1: Generating historical data...")
+    data_gen = DataGenerator(use_gpu=GPU_AVAILABLE)
+    hist_data = data_gen.generate_data(
+        n=CONFIG['n_hist'],
+        y_noise=CONFIG['y_noise'],
+        dgp_type=CONFIG['dgp_type'],
+        seed=CONFIG['seed']
     )
     
-    # Fit prognostic model on historical data
-    logger.info("Fitting prognostic model...")
-    model_selector = GPUModelSelector(use_gpu=gpu_enabled)
-    best_learner_name, prog_model_fitted, cv_rmse = model_selector.fit_prog(
-        train_dat=hist_train,
-        v=CV_FOLDS,
-        rng=MAIN_RNG
+    # Split into train/test (70/30)
+    train_size = int(0.7 * len(hist_data))
+    train_indices = np.random.RandomState(CONFIG['seed']).choice(
+        len(hist_data), size=train_size, replace=False
     )
-    prog_model = (best_learner_name, prog_model_fitted, cv_rmse)
     
-    # Calculate kappa on test set
-    kappa3 = calc_kappa(prog_model, hist_test)
-    logger.info(f"Prognostic model performance (kappa3): {kappa3:.4f}")
+    train_data = hist_data.iloc[train_indices]
+    test_data = hist_data.drop(train_indices)
     
-    # Calculate sig3 (SD of outcome)
-    sig3 = np.std(
-        np.concatenate([hist_train['Y'].values, hist_test['Y'].values]),
-        ddof=1  # Use n-1 denominator like R's sd()
+    logger.info(f"Training data: {len(train_data)} observations")
+    logger.info(f"Test data: {len(test_data)} observations")
+    
+    # ===== STEP 2: SELECT BEST MODEL =====
+    logger.info("\nStep 2: Selecting best model...")
+    model_selector = ModelSelector(use_gpu=GPU_AVAILABLE)
+    model_info = model_selector.select_best_model(
+        train_data,
+        cv_folds=CONFIG['cv_folds']
     )
-    logger.info(f"Outcome standard deviation (sig3): {sig3:.4f}")
+    
+    # Evaluate on test set
+    X_test = test_data[['W1', 'W2', 'W3', 'W4', 'W5', 'W6']]
+    y_test = test_data['Y']
+    
+    model_name, fitted_model, _ = model_info
+    if GPU_AVAILABLE and '_gpu' in model_name:
+        X_test_gpu = cudf.from_pandas(X_test)
+        y_pred = fitted_model.predict(X_test_gpu)
+        y_pred = cp.asnumpy(y_pred.values) if hasattr(y_pred, 'values') else cp.asnumpy(y_pred)
+    else:
+        y_pred = fitted_model.predict(X_test)
+    
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    logger.info(f"Test set RMSE: {test_rmse:.4f}")
+    
+    # ===== STEP 3: RUN MONTE CARLO EXPERIMENTS =====
+    logger.info("\nStep 3: Running Monte Carlo experiments...")
+    
+    # Create parameter combinations
+    all_params = []
+    for n_trials in CONFIG['n_trials_list']:
+        for i in range(CONFIG['n_iterations']):
+            all_params.append({
+                'n_trials': n_trials,
+                'model_info': model_info,
+                'y_noise': CONFIG['y_noise'],
+                'dgp_type': CONFIG['dgp_type'],
+                'iteration': i,
+                'seed': CONFIG['seed']
+            })
+    
+    logger.info(f"Total experiments: {len(all_params)}")
     
     # Run experiments in parallel
-    logger.info(f"Running {N_RUNS} Monte Carlo repetitions...")
+    results = []
     start_time = time.time()
     
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
-        futures = [executor.submit(run_experiment, i) for i in range(1, N_RUNS + 1)]
+    with ProcessPoolExecutor(max_workers=CONFIG['n_workers']) as executor:
+        # Submit all tasks
+        futures = [executor.submit(run_single_experiment, params) 
+                  for params in all_params]
         
-        # Track progress
-        completed = 0
-        failed = 0
-        
-        for future in tqdm(as_completed(futures), total=N_RUNS, desc="MC Runs"):
+        # Process results as they complete
+        for future in tqdm(as_completed(futures), total=len(futures)):
             try:
                 result = future.result()
-                if result:
-                    completed += 1
-                else:
-                    failed += 1
+                results.append(result)
             except Exception as e:
-                logger.error(f"Error in future: {str(e)}")
-                failed += 1
+                logger.error(f"Experiment failed: {e}")
     
-    duration = time.time() - start_time
-    logger.info(f"Completed {completed} runs, failed {failed} runs in {duration:.1f} seconds")
+    elapsed_time = time.time() - start_time
+    logger.info(f"Completed {len(results)} experiments in {elapsed_time:.1f} seconds")
     
-    # Create summary file like in R
-    logger.info("Creating metadata file...")
-    summary_df = pd.DataFrame({
-        'best_learner_name': [best_learner_name],
-        'kappa3': [kappa3],
-        'sig3': [sig3],
-        'dgp_string': [DGP_STRING],
-        'n_hist': [N_HIST],
-        'y_noise': [Y_NOISE],
-        'cv_folds': [CV_FOLDS],
-        'timestamp': [run_timestamp],
-        'completed_runs': [completed]
-    })
+    # ===== STEP 4: SAVE RESULTS =====
+    logger.info("\nStep 4: Saving results...")
     
-    # Write summary file
-    summary_path = BASE_DIR / f"run_metadata_{DGP_STRING}.parquet"
-    summary_table = pa.Table.from_pandas(summary_df)
-    pq.write_table(summary_table, summary_path)
+    # Convert results to DataFrame
+    results_df = pd.DataFrame(results)
     
-    logger.info(f"Metadata saved to {summary_path}")
-    logger.info(f"Finished simulation run {run_timestamp}")
+    # Add metadata
+    results_df['dgp_type'] = CONFIG['dgp_type']
+    results_df['y_noise'] = CONFIG['y_noise']
+    results_df['n_hist'] = CONFIG['n_hist']
+    
+    # Save to parquet
+    output_file = output_dir / 'simulation_results.parquet'
+    results_df.to_parquet(output_file, engine='pyarrow')
+    logger.info(f"Results saved to: {output_file}")
+    
+    # ===== STEP 5: PRINT SUMMARY =====
+    logger.info("\nStep 5: Summary Statistics")
+    logger.info("-" * 40)
+    
+    # Group by sample size
+    summary = results_df.groupby('n_trials').agg({
+        'test_rmse': ['mean', 'std'],
+        'ate_bias': ['mean', 'std'],
+        'estimated_ate': ['mean', 'std']
+    }).round(4)
+    
+    print("\nResults by Sample Size:")
+    print(summary)
+    
+    # Save summary
+    summary.to_csv(output_dir / 'summary_stats.csv')
+    
+    logger.info("\nSimulation complete!")
 
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def get_hist_dat(n_hist, y_noise=6, dgp_string="dgp3", rng=None):
-    """Generate historical data and split into training/test sets."""
-    if rng is None:
-        rng = MAIN_RNG
-    
-    data_gen = GPUDataGenerator(use_gpu=GPU_AVAILABLE)
-    data = data_gen.dgp(n=n_hist, y_noise=y_noise, dgp_string=dgp_string, rng=rng)
-    
-    # Split 70/30 like R's initial_split
-    train_indices = rng.choice(n_hist, size=int(0.7 * n_hist), replace=False)
-    train_df = data.iloc[train_indices].reset_index(drop=True)
-    test_df = data.drop(train_indices).reset_index(drop=True)
-    
-    logger.debug(f"Historical data split: {train_df.shape[0]} train, {test_df.shape[0]} test")
-    
-    return train_df, test_df
-
-def calc_kappa(prog_model, test_dat):
-    """Calculate RMSE on test data using prognostic model."""
-    best_learner_name, fitted_model, _ = prog_model
-    
-    X_test = test_dat.filter(like='W')
-    y_true = test_dat['Y']
-    
-    try:
-        if GPU_AVAILABLE and '_gpu' in best_learner_name:
-            try:
-                X_test_gpu = cudf.from_pandas(X_test)
-                y_pred = fitted_model.predict(X_test_gpu)
-                if hasattr(y_pred, 'values'):
-                    y_pred = y_pred.values
-                y_pred = cp.asnumpy(y_pred) if isinstance(y_pred, cp.ndarray) else y_pred
-            except:
-                y_pred = fitted_model.predict(X_test)
-        else:
-            y_pred = fitted_model.predict(X_test)
-    except Exception as e:
-        logger.error(f"Prediction failed in calc_kappa: {e}")
-        return float('inf')
-    
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    return rmse
-
-# =============================================================================
-# GLOBAL CONFIGURATION
-# =============================================================================
-
-# Simulation parameters (matching your R code)
-DGP_STRING = "dgp3"
-N_HIST = 2000
-Y_NOISE = 6
-CV_FOLDS = 20
-PARAM_GRID = {"n_trials": list(range(100, 501, 100))}  # 100, 150, ..., 500
-N_RUNS = 5000
-N_WORKERS = min(mp.cpu_count(), 32)
-USE_GPU = True
-BASE_SEED = 129483
-EXPERIMENT_SEED = 3021377
-
-# Output paths - use timestamp for unique folder
-run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-unique_run_name = f"run_{run_timestamp}"
-BASE_DIR = Path("results") / DGP_STRING / unique_run_name
-EXP_DIR = BASE_DIR / "experiments"
-EXP_DIR.mkdir(parents=True, exist_ok=True)
-
-# Set up logging
-log_filename = f"simulation_{run_timestamp}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler()
-    ]
-)
-
-logger = logging.getLogger(__name__)
-logger.info(f"Output directory created: {BASE_DIR}")
-
-# Create a random number generator for the main process
-MAIN_RNG = np.random.RandomState(BASE_SEED)
 
 if __name__ == "__main__":
     main()
