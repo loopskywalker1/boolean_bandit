@@ -1,493 +1,127 @@
-# Simple Federated Prometheus Setup for Rancher with Fleet
+# Fleet configuration for dords Helm chart - Development
+defaultNamespace: core
 
-## Repository Structure in GitLab
-
-```
-rancher-prometheus-federation/
-├── README.md
-├── .gitlab-ci.yml
-├── fleet.yaml                    # Fleet configuration
-├── values.yaml                   # Default values
-├── values-dev.yaml              # Dev environment overrides
-├── values-prod.yaml             # Prod environment overrides
-└── version.yaml                 # Version management file
-```
-
-## Step 1: Create Fleet Configuration
-
-```yaml
-# fleet.yaml
-defaultNamespace: cattle-monitoring-system
-
-helm:
-  repo: https://charts.rancher.io
-  chart: rancher-monitoring
-  version: 103.0.3+up45.31.1    # This will be managed via version.yaml
-  releaseName: rancher-monitoring
-  valuesFiles:
-    - values.yaml
-  
-diff:
-  comparePatches:
-  - apiVersion: admissionregistration.k8s.io/v1
-    kind: ValidatingWebhookConfiguration
-    name: rancher-monitoring-admission
-    operations:
-    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
-  - apiVersion: admissionregistration.k8s.io/v1
-    kind: MutatingWebhookConfiguration 
-    name: rancher-monitoring-admission
-    operations:
-    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
-
-targetCustomizations:
+# Target only dev cluster
+targets:
 - name: dev
   clusterSelector:
     matchLabels:
-      environment: dev
-  helm:
-    valuesFiles:
-    - values.yaml
-    - values-dev.yaml
+      env: dev
 
+# Helm configuration for dev
+helm:
+  # Chart path - go up two directories then into dords folder
+  chart: "../../dords"
+  
+  # Release name
+  releaseName: dords
+  
+  # Values file for dev (relative to the chart root)
+  valuesFiles:
+  - values-dev.yaml
+  
+  # Development-specific settings
+  force: false
+  maxHistory: 3
+  timeout: 5m
+  wait: true
+  atomic: true
+
+# Faster polling for dev
+pollingInterval: 10s
+
+# Less restrictive rollout for dev
+rolloutStrategy:
+  autoPartitionSize: 100%
+  maxUnavailable: 1
+
+______________
+
+# Fleet configuration for dords Helm chart - Staging
+defaultNamespace: core
+
+# Target only staging cluster
+targets:
+- name: staging
+  clusterSelector:
+    matchLabels:
+      env: staging
+
+# Helm configuration for staging
+helm:
+  # Chart path - go up two directories then into dords folder
+  chart: "../../dords"
+  
+  # Release name
+  releaseName: dords
+  
+  # Values file for staging (relative to the chart root)
+  valuesFiles:
+  - values-staging.yaml
+  
+  # Staging-specific settings
+  force: false
+  maxHistory: 5
+  timeout: 10m
+  wait: true
+  atomic: true
+
+# Moderate polling for staging
+pollingInterval: 30s
+
+# Careful rollout for staging
+rolloutStrategy:
+  autoPartitionSize: 50%
+  maxUnavailable: 1
+  maxUnavailablePartitions: 1
+
+_______________
+
+# Fleet configuration for dords Helm chart - Production
+defaultNamespace: core
+
+# Target only prod cluster(s)
+targets:
 - name: prod
   clusterSelector:
     matchLabels:
-      environment: prod
-  helm:
-    valuesFiles:
-    - values.yaml
-    - values-prod.yaml
-```
+      env: prod
 
-## Step 2: Create Base Values File
-
-```yaml
-# values.yaml
-# Rancher Monitoring - Prometheus Federation Configuration
-
-prometheus:
-  prometheusSpec:
-    # Enable federation
-    enableFeatures:
-      - remote-write-receiver
-      - federation
-    
-    # Retention settings
-    retention: 30d
-    retentionSize: "200GB"
-    
-    # Resources
-    resources:
-      requests:
-        cpu: 2000m
-        memory: 4Gi
-      limits:
-        cpu: 4000m
-        memory: 8Gi
-    
-    # Storage with Longhorn
-    storageSpec:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: longhorn
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 300Gi
-    
-    # Service configuration for federation
-    service:
-      type: NodePort
-      nodePort: 30090
-    
-    # External labels to identify this Prometheus
-    externalLabels:
-      cluster: "management"
-      prometheus: "rancher-monitoring"
-    
-    # Scrape configs for federation
-    additionalScrapeConfigs:
-      # Federate from cluster Prometheus instances
-      - job_name: 'federate-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{job=~".+"}'  # Adjust this to be more selective
-        static_configs:
-          - targets: []  # Will be populated per environment
-
-grafana:
-  enabled: true
+# Helm configuration for production
+helm:
+  # Chart path - go up two directories then into dords folder
+  chart: "../../dords"
   
-  # Admin credentials - use a secret in production
-  adminPassword: "changeme"
+  # Release name
+  releaseName: dords
   
-  # Persistence
-  persistence:
-    enabled: true
-    storageClassName: longhorn
-    size: 20Gi
+  # Values file for production (relative to the chart root)
+  valuesFiles:
+  - values-prod.yaml
   
-  # Service
-  service:
-    type: NodePort
-    nodePort: 30080
-  
-  # Default dashboards
-  defaultDashboardsEnabled: true
-  
-  # Sidecar for loading dashboards
-  sidecar:
-    dashboards:
-      enabled: true
-      label: grafana_dashboard
-      labelValue: "1"
-    datasources:
-      enabled: true
-      label: grafana_datasource
-      labelValue: "1"
+  # Production-specific settings
+  force: false
+  maxHistory: 10
+  timeout: 15m
+  wait: true
+  atomic: true
 
-alertmanager:
-  enabled: true
-  alertmanagerSpec:
-    storage:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: longhorn
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 10Gi
-  
-  service:
-    type: NodePort
-    nodePort: 30093
+# Slower polling for production
+pollingInterval: 60s
 
-# Disable components we don't need for simplicity
-kubeStateMetrics:
-  enabled: true
+# Very careful rollout for production
+rolloutStrategy:
+  autoPartitionSize: 25%
+  maxUnavailable: 0
+  maxUnavailablePartitions: 1
 
-nodeExporter:
-  enabled: true
+# Production-specific diff configuration
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    operations:
+    - {"op": "remove", "path": "/spec/replicas"}
+    - {"op": "remove", "path": "/metadata/labels/cattle.io~1os"}
 
-prometheusOperator:
-  enabled: true
-  manageCrds: true
-
-# Disable these for now to keep it simple
-pushgateway:
-  enabled: false
-
-ingressNginx:
-  enabled: false
-
-rancherMonitoring:
-  enabled: true
-```
-
-## Step 3: Environment-Specific Values
-
-```yaml
-# values-dev.yaml
-prometheus:
-  prometheusSpec:
-    replicas: 1
-    retention: 7d
-    retentionSize: "50GB"
-    
-    resources:
-      requests:
-        cpu: 500m
-        memory: 1Gi
-      limits:
-        cpu: 1000m
-        memory: 2Gi
-    
-    storageSpec:
-      volumeClaimTemplate:
-        spec:
-          resources:
-            requests:
-              storage: 100Gi
-    
-    # Dev cluster federation targets
-    additionalScrapeConfigs:
-      - job_name: 'federate-dev-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{__name__=~"node_.*"}'
-            - '{__name__=~"kube_.*"}'
-            - '{__name__=~"container_.*"}'
-        static_configs:
-          - targets:
-            - 'dev-cluster-1.local:30090'
-            - 'dev-cluster-2.local:30090'
-
-grafana:
-  adminPassword: "devpassword"  # Change this!
-```
-
-```yaml
-# values-prod.yaml
-prometheus:
-  prometheusSpec:
-    replicas: 2
-    retention: 30d
-    retentionSize: "500GB"
-    
-    # HA configuration
-    replicaExternalLabelName: "prometheus_replica"
-    prometheusExternalLabelName: "prometheus"
-    
-    # Production federation targets
-    additionalScrapeConfigs:
-      - job_name: 'federate-prod-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{__name__=~"node_.*"}'
-            - '{__name__=~"kube_.*"}'
-            - '{__name__=~"container_.*"}'
-            - '{__name__=~"up"}'
-        static_configs:
-          - targets:
-            - 'prod-cluster-1.local:30090'
-            - 'prod-cluster-2.local:30090'
-            - 'prod-cluster-3.local:30090'
-
-grafana:
-  adminPassword: "prodpassword"  # Use a secret!
-  
-  # Additional production settings
-  ingress:
-    enabled: false  # Using NodePort as specified
-```
-
-## Step 4: Version Management File
-
-```yaml
-# version.yaml
-# This file manages the Helm chart version
-# Update this when you want to upgrade the monitoring stack
-
-rancher_monitoring:
-  chart_version: "103.0.3+up45.31.1"
-  app_version: "v0.65.1"
-  
-# Version history for rollback reference
-version_history:
-  - version: "103.0.3+up45.31.1"
-    date: "2024-01-15"
-    notes: "Initial deployment"
-  - version: "102.0.2+up40.1.2"
-    date: "2023-12-01"
-    notes: "Previous stable version"
-```
-
-## Step 5: GitLab CI/CD Pipeline
-
-```yaml
-# .gitlab-ci.yml
-stages:
-  - validate
-  - update-version
-  - deploy
-
-variables:
-  GIT_STRATEGY: clone
-  FLEET_NAMESPACE: fleet-default
-
-# Validate Helm values
-validate:
-  stage: validate
-  image: alpine/helm:latest
-  script:
-    - echo "Validating Helm values files..."
-    - helm lint . || true
-    - echo "Checking YAML syntax..."
-    - |
-      for file in *.yaml; do
-        echo "Validating $file"
-        cat $file | yaml lint - || exit 1
-      done
-  only:
-    - merge_requests
-    - main
-
-# Update Fleet configuration with new version
-update-version:
-  stage: update-version
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache yq git
-  script:
-    - |
-      # Extract version from version.yaml
-      CHART_VERSION=$(yq eval '.rancher_monitoring.chart_version' version.yaml)
-      echo "Chart version: $CHART_VERSION"
-      
-      # Update fleet.yaml with new version
-      yq eval -i ".helm.version = \"$CHART_VERSION\"" fleet.yaml
-      
-      # Commit if changed
-      if [[ $(git status --porcelain) ]]; then
-        git config user.email "ci@example.com"
-        git config user.name "GitLab CI"
-        git add fleet.yaml
-        git commit -m "Update rancher-monitoring to version $CHART_VERSION"
-      fi
-  only:
-    - main
-  artifacts:
-    paths:
-      - fleet.yaml
-
-# Deploy to Rancher using Fleet
-deploy:
-  stage: deploy
-  image: rancher/kubectl:v1.27.0
-  script:
-    - |
-      # Create or update Fleet GitRepo
-      cat <<EOF | kubectl apply -f -
-      apiVersion: fleet.cattle.io/v1alpha1
-      kind: GitRepo
-      metadata:
-        name: prometheus-federation
-        namespace: ${FLEET_NAMESPACE}
-      spec:
-        repo: ${CI_PROJECT_URL}.git
-        branch: ${CI_COMMIT_REF_NAME}
-        clientSecretName: gitlab-secret
-        paths:
-        - .
-        targets:
-        - name: management
-          clusterSelector:
-            matchLabels:
-              management: "true"
-      EOF
-      
-      # Wait for deployment
-      echo "Waiting for Fleet to sync..."
-      kubectl -n ${FLEET_NAMESPACE} wait --for=condition=Ready gitrepo/prometheus-federation --timeout=300s
-  only:
-    - main
-  when: manual
-```
-
-## Step 6: Setup Instructions
-
-### 1. Create GitLab Repository
-
-```bash
-# Initialize your GitLab repository
-git init rancher-prometheus-federation
-cd rancher-prometheus-federation
-
-# Create all the files above
-touch fleet.yaml values.yaml values-dev.yaml values-prod.yaml version.yaml .gitlab-ci.yml README.md
-
-# Copy the content into each file
-
-# Initial commit
-git add .
-git commit -m "Initial Prometheus federation setup"
-git remote add origin https://gitlab.com/your-org/rancher-prometheus-federation.git
-git push -u origin main
-```
-
-### 2. Create GitLab Secret in Rancher
-
-```bash
-# Create secret for Fleet to access GitLab
-kubectl create secret generic gitlab-secret \
-  -n fleet-default \
-  --from-literal=username=<gitlab-username> \
-  --from-literal=password=<gitlab-token>
-```
-
-### 3. Label Your Clusters
-
-```bash
-# Label your management cluster
-kubectl label cluster <cluster-name> management=true
-
-# Label environment clusters
-kubectl label cluster <dev-cluster> environment=dev
-kubectl label cluster <prod-cluster> environment=prod
-```
-
-### 4. Deploy Using Fleet
-
-```bash
-# Apply the GitRepo to trigger Fleet deployment
-kubectl apply -f - <<EOF
-apiVersion: fleet.cattle.io/v1alpha1
-kind: GitRepo
-metadata:
-  name: prometheus-federation
-  namespace: fleet-default
-spec:
-  repo: https://gitlab.com/your-org/rancher-prometheus-federation.git
-  branch: main
-  clientSecretName: gitlab-secret
-  paths:
-  - .
-  targets:
-  - name: management
-    clusterSelector:
-      matchLabels:
-        management: "true"
-EOF
-```
-
-## Step 7: Updating Versions
-
-When you want to update to a new version of rancher-monitoring:
-
-1. **Check available versions:**
-   ```bash
-   helm search repo rancher/rancher-monitoring --versions
-   ```
-
-2. **Update version.yaml:**
-   ```yaml
-   rancher_monitoring:
-     chart_version: "103.0.4+up45.31.2"  # New version
-     app_version: "v0.65.2"
-   ```
-
-3. **Commit and push:**
-   ```bash
-   git add version.yaml
-   git commit -m "Update rancher-monitoring to 103.0.4+up45.31.2"
-   git push
-   ```
-
-4. **GitLab CI will automatically update fleet.yaml and Fleet will deploy**
-
-## Access Your Monitoring
-
-After deployment:
-- **Prometheus**: `http://<any-node-ip>:30090`
-- **Grafana**: `http://<any-node-ip>:30080`
-- **Alertmanager**: `http://<any-node-ip>:30093`
-
-## Next Steps
-
-Once this is working, you can:
-1. Add federation targets for your other clusters
-2. Create custom Grafana dashboards
-3. Set up alerting rules
-4. Add authentication/security
-
-This setup gives you a simple, maintainable way to deploy federated Prometheus with version control through GitLab and automated deployment through Fleet.
+______________
