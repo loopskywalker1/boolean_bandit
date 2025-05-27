@@ -1,537 +1,613 @@
-#!/usr/bin/env python3
-"""
-Complete Causal Inference Power Simulation
-Matches R output with kappa3 ≈ 6.4, sig3 ≈ 13.1
-"""
+# Simple Federated Prometheus Setup for Rancher with Fleet
 
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import Ridge, Lasso, ElasticNet, LinearRegression
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.metrics import mean_squared_error
-from scipy import stats
-import statsmodels.api as sm
-from tqdm import tqdm
-import logging
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import warnings
-warnings.filterwarnings('ignore')
+## Repository Structure in GitLab
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+```
+rancher-prometheus-federation/
+├── README.md
+├── .gitlab-ci.yml
+├── fleet.yaml                    # Fleet configuration
+├── values.yaml                   # Default values
+├── values-dev.yaml              # Dev environment overrides
+├── values-prod.yaml             # Prod environment overrides
+└── version.yaml                 # Version management file
+```
 
+## Step 1: Create Fleet Configuration
 
-class DataGenerator:
-    """Generate synthetic data for causal inference"""
-    
-    def generate_data(self, n, y_noise=6, dgp_string="dgp3", seed=None):
-        """Generate data matching R's dgp function exactly"""
-        if seed is not None:
-            np.random.seed(seed)
-            
-        # Generate W1-W6 uniformly from [-1, 1]
-        W1 = np.random.uniform(-1, 1, n)
-        W2 = np.random.uniform(-1, 1, n)
-        W3 = np.random.uniform(-1, 1, n)
-        W4 = np.random.uniform(-1, 1, n)
-        W5 = np.random.uniform(-1, 1, n)
-        W6 = np.random.uniform(-1, 1, n)
-        
-        if dgp_string == "constant":
-            mu0 = np.sin(np.abs(W1)) * np.pi/10 - 3
-            mu1 = np.sin(np.abs(W1)) * np.pi/10
-            
-        elif dgp_string == "heterogeneous":
-            mu0 = np.sin(np.abs(W1)) * (np.pi/10)**2 - 30.00103
-            mu1 = np.sin(np.abs(W1)) * np.pi/10
-            
-        elif dgp_string == "dgp1":
-            mu0 = W1**2 + W3 + W5 + W6
-            mu1 = W1**2 + W2 + W3 + W5 + W6
-            
-        elif dgp_string == "dgp2":
-            mu0 = 2*W1 + 2*W3 + 2.4*W4 + W5 - np.sqrt(np.abs(W6)) - 3*W1*W4
-            mu1 = 1.7*W1 + 2*W2 - 0.2*W3 + W5 - np.sqrt(np.abs(W6)) - 2*W1*W6 + 3.015
-            
-        elif dgp_string == "dgp3":
-            mu0 = W1**2 + 2.4*W3 + W5 + 0.5*W6 - np.sqrt(np.abs(W1))
-            mu1 = W1**2 + 2*W2 - 0.2*W3 + W5 + 0.5*W6 - np.sqrt(np.abs(W1))
-            
-        elif dgp_string == "dgp4":
-            mu0 = np.sin(np.abs(W1)) * np.pi/4 * 2
-            mu1 = (W1 + W2 + W3) / 1.5
-            
-        elif dgp_string == "dgp5":
-            mu0 = (W1 + W3) / 1.2 + 2.5823
-            mu1 = ((W1 + W2 + W3) / 1.5 + 
-                   (W1 < 0) * ((np.sin(np.abs(W1)) * np.pi) * 4 - 2) * 2 + 
-                   (W1 >= 0) * 2.6667435)
-        
-        # Add noise
-        Y0 = mu0 + np.random.normal(0, y_noise, n)
-        Y1 = mu1 + np.random.normal(0, y_noise, n)
-        
-        # Treatment assignment
-        A = np.random.binomial(1, 0.5, n)
-        
-        # Observed outcome
-        Y = A * Y1 + (1 - A) * Y0
-        
-        return pd.DataFrame({
-            'W1': W1, 'W2': W2, 'W3': W3, 'W4': W4, 'W5': W5, 'W6': W6,
-            'A': A, 'Y': Y, 'Y0': Y0, 'Y1': Y1
-        })
+```yaml
+# fleet.yaml
+defaultNamespace: cattle-monitoring-system
 
+helm:
+  repo: https://charts.rancher.io
+  chart: rancher-monitoring
+  version: 103.0.3+up45.31.1    # This will be managed via version.yaml
+  releaseName: rancher-monitoring
+  valuesFiles:
+    - values.yaml
+  
+diff:
+  comparePatches:
+  - apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingWebhookConfiguration
+    name: rancher-monitoring-admission
+    operations:
+    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
+  - apiVersion: admissionregistration.k8s.io/v1
+    kind: MutatingWebhookConfiguration 
+    name: rancher-monitoring-admission
+    operations:
+    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
 
-class ModelSelector:
-    """Select best model using cross-validation"""
-    
-    def __init__(self):
-        self.models = self.get_candidate_models()
-        
-    def get_candidate_models(self):
-        """Get candidate models matching R's discreteSL"""
-        return {
-            'knn': KNeighborsRegressor(n_neighbors=5),
-            'lm': LinearRegression(),
-            'rf': RandomForestRegressor(
-                n_estimators=500,
-                max_depth=5,
-                min_samples_leaf=5,
-                max_features='sqrt',
-                random_state=42,
-                n_jobs=-1
-            ),
-            'boost_tree': GradientBoostingRegressor(
-                n_estimators=500,
-                max_depth=5,
-                learning_rate=0.1,
-                subsample=0.8,
-                random_state=42
-            )
-        }
-    
-    def fit_prog(self, train_data, V=10):
-        """Fit prognostic model using cross-validation"""
-        feature_cols = ['W1', 'W2', 'W3', 'W4', 'W5', 'W6']
-        X = train_data[feature_cols]
-        y = train_data['Y']
-        
-        # Cross-validate each model
-        cv_results = {}
-        kf = KFold(n_splits=V, shuffle=True, random_state=42)
-        
-        logger.info(f"Cross-validating {len(self.models)} models...")
-        
-        for name, model in self.models.items():
-            try:
-                scores = cross_val_score(
-                    model, X, y,
-                    cv=kf,
-                    scoring='neg_root_mean_squared_error',
-                    n_jobs=1
-                )
-                cv_rmse = -scores.mean()
-                cv_results[name] = cv_rmse
-                logger.debug(f"{name}: CV RMSE = {cv_rmse:.4f}")
-            except Exception as e:
-                logger.error(f"Error with {name}: {e}")
-                cv_results[name] = float('inf')
-        
-        # Select best model
-        best_name = min(cv_results, key=cv_results.get)
-        best_rmse = cv_results[best_name]
-        
-        logger.info(f"Best model: {best_name} (CV RMSE: {best_rmse:.4f})")
-        
-        # Refit on full training data
-        best_model = self.models[best_name]
-        best_model.fit(X, y)
-        
-        return best_name, best_model, best_rmse
+targetCustomizations:
+- name: dev
+  clusterSelector:
+    matchLabels:
+      environment: dev
+  helm:
+    valuesFiles:
+    - values.yaml
+    - values-dev.yaml
 
+- name: prod
+  clusterSelector:
+    matchLabels:
+      environment: prod
+  helm:
+    valuesFiles:
+    - values.yaml
+    - values-prod.yaml
+```
 
-class CausalEstimators:
-    """Implement causal estimators"""
-    
-    @staticmethod
-    def unadjusted_estimator(data):
-        """Simple difference in means"""
-        treated = data[data['A'] == 1]['Y']
-        control = data[data['A'] == 0]['Y']
-        
-        effect = treated.mean() - control.mean()
-        n1 = len(treated)
-        n0 = len(control)
-        se = np.sqrt(treated.var(ddof=1)/n1 + control.var(ddof=1)/n0)
-        
-        return {'effect': effect, 'se': se}
-    
-    @staticmethod
-    def tmle_estimator(data, prog_model=None, kappa=None, sig=None):
-        """TMLE estimator"""
-        feature_cols = ['W1', 'W2', 'W3', 'W4', 'W5', 'W6']
-        X = data[feature_cols]
-        A = data['A']
-        Y = data['Y']
-        n = len(data)
-        
-        # Get unadjusted estimate first
-        unadj = CausalEstimators.unadjusted_estimator(data)
-        
-        if prog_model is None:
-            # TMLE without prognostic model
-            return {
-                'effect': unadj['effect'],
-                'se': unadj['se'] * 0.95  # Slight efficiency gain
-            }
-        else:
-            # TMLE with prognostic model
-            # Get predictions
-            pred_Y = prog_model.predict(X)
-            residuals = Y - pred_Y
-            
-            # Efficiency gain from using predictions
-            effect = unadj['effect'] + np.mean(residuals * (A - 0.5) * 2)
-            
-            # Standard error with efficiency gain
-            if kappa is not None and sig is not None:
-                efficiency_factor = np.sqrt(1 - kappa**2 / sig**2)
-                se = unadj['se'] * efficiency_factor
-            else:
-                se = unadj['se'] * 0.85  # Default efficiency gain
-            
-            return {'effect': effect, 'se': se}
+## Step 2: Create Base Values File
 
+```yaml
+# values.yaml
+# Rancher Monitoring - Prometheus Federation Configuration
 
-def calculate_metrics(data):
-    """Calculate sig, sigma0, sigma1, gamma"""
-    sig = np.std(data['Y'], ddof=1)
+prometheus:
+  prometheusSpec:
+    # Enable federation
+    enableFeatures:
+      - remote-write-receiver
+      - federation
     
-    control_data = data[data['A'] == 0]
-    treated_data = data[data['A'] == 1]
+    # Retention settings
+    retention: 30d
+    retentionSize: "400GB"
     
-    sigma0 = np.std(control_data['Y'], ddof=1)
-    sigma1 = np.std(treated_data['Y'], ddof=1)
+    # Resources
+    resources:
+      requests:
+        cpu: 2000m
+        memory: 4Gi
+      limits:
+        cpu: 4000m
+        memory: 8Gi
     
-    gamma = (sigma0**2 - sigma1**2) / (sigma0**2 + sigma1**2)
+    # Storage with Longhorn - sized for 30 days retention
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 500Gi  # Increased for federation data
     
-    return sig, sigma0, sigma1, gamma
+    # External labels to identify this Prometheus
+    externalLabels:
+      cluster: "management"
+      prometheus: "rancher-monitoring"
+    
+    # Scrape configs for federation
+    additionalScrapeConfigs:
+      # Federate from cluster Prometheus instances
+      - job_name: 'federate-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{job=~".+"}'  # Adjust this to be more selective
+        static_configs:
+          - targets: []  # Will be populated per environment
+  
+  # Ingress configuration for Prometheus
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"  # If using cert-manager
+    hosts:
+      - prometheus.acidev.mycompany.org
+    paths:
+      - /
+    tls:
+      - secretName: acidev-tls
+        hosts:
+          - prometheus.acidev.mycompany.org
+  
+  # Service configuration
+  service:
+    type: ClusterIP  # Changed from NodePort since we're using Ingress
 
+grafana:
+  enabled: true
+  
+  # Admin credentials - use a secret in production
+  adminPassword: "changeme"
+  
+  # Persistence with adequate storage
+  persistence:
+    enabled: true
+    storageClassName: longhorn
+    size: 50Gi  # Increased for dashboards and data
+  
+  # Ingress configuration for Grafana
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"  # If using cert-manager
+    hosts:
+      - grafana.acidev.mycompany.org
+    path: /
+    tls:
+      - secretName: acidev-tls
+        hosts:
+          - grafana.acidev.mycompany.org
+  
+  # Service configuration
+  service:
+    type: ClusterIP  # Changed from NodePort since we're using Ingress
+  
+  # Default dashboards
+  defaultDashboardsEnabled: true
+  
+  # Sidecar for loading dashboards
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
 
-def run_single_experiment(params):
-    """Run a single experiment"""
-    n_trial = params['n_trial']
-    prog_model = params['prog_model']
-    kappa = params['kappa']
-    sig = params['sig']
-    y_noise = params['y_noise']
-    dgp_string = params['dgp_string']
-    run = params['run']
-    seed = params['seed']
-    
-    # Set seed
-    np.random.seed(seed + run + n_trial * 1000)
-    
-    # Generate trial data
-    data_gen = DataGenerator()
-    trial_data = data_gen.generate_data(
-        n=n_trial,
-        y_noise=y_noise,
-        dgp_string=dgp_string
-    )
-    
-    # Calculate estimators
-    estimators = CausalEstimators()
-    
-    # Unadjusted
-    unadj = estimators.unadjusted_estimator(trial_data)
-    
-    # TMLE without prog
-    tmle_none = estimators.tmle_estimator(trial_data, prog_model=None)
-    
-    # TMLE with prog
-    tmle_fit = estimators.tmle_estimator(
-        trial_data, 
-        prog_model=prog_model[1],  # Extract model from tuple
-        kappa=kappa,
-        sig=sig
-    )
-    
-    return {
-        'run': run,
-        'n_trial': n_trial,
-        'unadj_effect': unadj['effect'],
-        'unadj_se': unadj['se'],
-        'unadj_sig': abs(unadj['effect'] / unadj['se']) > 1.96,
-        'tmle_none_effect': tmle_none['effect'],
-        'tmle_none_se': tmle_none['se'],
-        'tmle_none_sig': abs(tmle_none['effect'] / tmle_none['se']) > 1.96,
-        'tmle_fit_effect': tmle_fit['effect'],
-        'tmle_fit_se': tmle_fit['se'],
-        'tmle_fit_sig': abs(tmle_fit['effect'] / tmle_fit['se']) > 1.96
-    }
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi  # Increased for alert history
+  
+  # Optional: Also expose AlertManager via Ingress
+  ingress:
+    enabled: false  # Enable if you want external access
+    ingressClassName: nginx
+    hosts:
+      - alertmanager.acidev.mycompany.org
+    paths:
+      - /
+    tls:
+      - secretName: acidev-tls
+        hosts:
+          - alertmanager.acidev.mycompany.org
+  
+  service:
+    type: ClusterIP
 
+# Disable components we don't need for simplicity
+kubeStateMetrics:
+  enabled: true
 
-def create_power_plot(results_df, kappa, sig, sigma0, sigma1):
-    """Create power plot matching R output"""
-    
-    plt.figure(figsize=(10, 8))
-    
-    # Theoretical power curves
-    n_range = np.arange(100, 1100, 50)
-    
-    # Unadjusted design power (theoretical)
-    unadj_power = []
-    for n in n_range:
-        se = np.sqrt(2 * sig**2 / n)
-        ncp = 3 / se  # Effect size = 3
-        power = 1 - stats.norm.cdf(1.96 - ncp)
-        unadj_power.append(power)
-    
-    # Efficient design power (theoretical)
-    eff_power = []
-    for n in n_range:
-        se = np.sqrt(2 * sig**2 / n) * np.sqrt(1 - kappa**2 / sig**2)
-        ncp = 3 / se
-        power = 1 - stats.norm.cdf(1.96 - ncp)
-        eff_power.append(power)
-    
-    # Plot theoretical curves
-    plt.plot(n_range, unadj_power, '--', color='#8B4513', linewidth=2, 
-             label='unadjusted design')
-    plt.plot(n_range, eff_power, '--', color='#DC143C', linewidth=2, 
-             label='efficient design')
-    
-    # Plot empirical results
-    unadj_data = results_df[results_df['estimator'] == 'unadjusted']
-    tmle_none_data = results_df[results_df['estimator'] == 'tmle_none']
-    tmle_fit_data = results_df[results_df['estimator'] == 'tmle_fit']
-    
-    plt.plot(unadj_data['n_trial'], unadj_data['power'], 'o-', 
-             color='#FFD700', linewidth=2, markersize=6,
-             label='empirical unadjusted')
-    
-    plt.plot(tmle_none_data['n_trial'], tmle_none_data['power'], 'o-', 
-             color='#87CEEB', linewidth=2, markersize=6,
-             label='empirical TMLE')
-    
-    plt.plot(tmle_fit_data['n_trial'], tmle_fit_data['power'], 'o-', 
-             color='#000080', linewidth=2, markersize=6,
-             label='empirical TMLE with prog.')
-    
-    # Add reference lines
-    plt.axhline(y=0.8, color='black', linestyle=':', alpha=0.5)
-    plt.axvline(x=350, color='black', linestyle=':', alpha=0.5)
-    
-    # Formatting
-    plt.xlabel('trial sample size', fontsize=14)
-    plt.ylabel('Power from simulation', fontsize=14)
-    plt.title('Power from simulation', fontsize=16)
-    plt.legend(loc='lower right', fontsize=12)
-    plt.grid(True, alpha=0.3)
-    plt.xlim(50, 1050)
-    plt.ylim(0.15, 1.02)
-    
-    plt.tight_layout()
-    plt.savefig('dgp3.png', dpi=300, bbox_inches='tight')
-    plt.show()
+nodeExporter:
+  enabled: true
 
+prometheusOperator:
+  enabled: true
+  manageCrds: true
 
-def print_results_table(results_df):
-    """Print results in R table format"""
-    
-    # Create summary for specific sample sizes
-    sample_sizes = [100, 150, 200, 250, 300, 350, 400]
-    
-    print("\n" + " "*10 + "effect      se       prog    estr        lrnr           n_trial")
-    
-    row = 1
-    for n in sample_sizes:
-        # Unadjusted
-        unadj = results_df[(results_df['n_trial'] == n) & 
-                          (results_df['estimator'] == 'unadjusted')].iloc[0]
-        print(f"{row:2d}  {unadj['avg_effect']:8.5f} {unadj['avg_se']:8.5f}  none    unadjusted  none           {n:4d}")
-        row += 1
-        
-        # TMLE none
-        tmle_none = results_df[(results_df['n_trial'] == n) & 
-                              (results_df['estimator'] == 'tmle_none')].iloc[0]
-        print(f"{row:2d}  {tmle_none['avg_effect']:8.5f} {tmle_none['avg_se']:8.5f}  none    tmle        discrete_sl    {n:4d}")
-        row += 1
-        
-        # TMLE fit
-        tmle_fit = results_df[(results_df['n_trial'] == n) & 
-                             (results_df['estimator'] == 'tmle_fit')].iloc[0]
-        print(f"{row:2d}  {tmle_fit['avg_effect']:8.5f} {tmle_fit['avg_se']:8.5f}  fit     tmle        discrete_sl    {n:4d}")
-        row += 1
+# Disable these for now to keep it simple
+pushgateway:
+  enabled: false
 
+ingressNginx:
+  enabled: false
 
-def main():
-    """Main function to run complete power simulation"""
-    
-    # Configuration
-    CONFIG = {
-        'dgp_string': 'dgp3',
-        'n_hist': 2000,
-        'y_noise': 6,
-        'V': 10,
-        'n_runs': 200,
-        'n_workers': min(8, os.cpu_count()),
-        'base_seed': 129483,
-        'experimental_seed': 3021377
-    }
-    
-    # Set base seed
-    np.random.seed(CONFIG['base_seed'])
-    
-    # Generate historical data
-    logger.info("Generating historical data...")
-    data_gen = DataGenerator()
-    hist_data = data_gen.generate_data(
-        n=CONFIG['n_hist'],
-        y_noise=CONFIG['y_noise'],
-        dgp_string=CONFIG['dgp_string']
-    )
-    
-    # Split 70/30
-    n_train = int(0.7 * CONFIG['n_hist'])
-    train_idx = np.random.choice(CONFIG['n_hist'], size=n_train, replace=False)
-    test_idx = np.setdiff1d(np.arange(CONFIG['n_hist']), train_idx)
-    
-    train_data = hist_data.iloc[train_idx].reset_index(drop=True)
-    test_data = hist_data.iloc[test_idx].reset_index(drop=True)
-    
-    logger.info(f"Training data: {len(train_data)} observations")
-    logger.info(f"Test data: {len(test_data)} observations")
-    
-    # Fit prognostic model
-    logger.info("Fitting prognostic model...")
-    model_selector = ModelSelector()
-    prog_model = model_selector.fit_prog(train_data, V=CONFIG['V'])
-    
-    # Calculate kappa on test set
-    feature_cols = ['W1', 'W2', 'W3', 'W4', 'W5', 'W6']
-    y_pred = prog_model[1].predict(test_data[feature_cols])
-    kappa3 = np.sqrt(mean_squared_error(test_data['Y'], y_pred))
-    
-    # Calculate metrics on combined data
-    sig3, sigma03, sigma13, gamma3 = calculate_metrics(hist_data)
-    
-    logger.info(f"\nMetrics:")
-    logger.info(f"Best model: {prog_model[0]}")
-    logger.info(f"kappa3 = {kappa3:.6f}")
-    logger.info(f"sig3 = {sig3:.5f}")
-    logger.info(f"sigma03 = {sigma03:.5f}")
-    logger.info(f"sigma13 = {sigma13:.5f}")
-    logger.info(f"gamma3 = {gamma3:.6f}")
-    
-    # Sample sizes for experiments
-    n_trials = [100, 150, 200, 250, 300, 350, 400, 450, 500, 
-                600, 700, 800, 900, 1000]
-    
-    # Create parameter grid
-    all_params = []
-    for n_trial in n_trials:
-        for run in range(CONFIG['n_runs']):
-            all_params.append({
-                'n_trial': n_trial,
-                'prog_model': prog_model,
-                'kappa': kappa3,
-                'sig': sig3,
-                'y_noise': CONFIG['y_noise'],
-                'dgp_string': CONFIG['dgp_string'],
-                'run': run,
-                'seed': CONFIG['experimental_seed']
-            })
-    
-    logger.info(f"\nRunning {len(all_params)} experiments...")
-    
-    # Run experiments in parallel
-    results = []
-    with ProcessPoolExecutor(max_workers=CONFIG['n_workers']) as executor:
-        futures = [executor.submit(run_single_experiment, params) 
-                  for params in all_params]
-        
-        for future in tqdm(as_completed(futures), total=len(futures)):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                logger.error(f"Experiment failed: {e}")
-    
-    # Convert to DataFrame
-    results_df = pd.DataFrame(results)
-    
-    # Calculate power by sample size and estimator
-    power_results = []
-    for n_trial in n_trials:
-        trial_results = results_df[results_df['n_trial'] == n_trial]
-        
-        # Unadjusted
-        power_results.append({
-            'n_trial': n_trial,
-            'estimator': 'unadjusted',
-            'power': trial_results['unadj_sig'].mean(),
-            'avg_effect': trial_results['unadj_effect'].mean(),
-            'avg_se': trial_results['unadj_se'].mean()
-        })
-        
-        # TMLE none
-        power_results.append({
-            'n_trial': n_trial,
-            'estimator': 'tmle_none',
-            'power': trial_results['tmle_none_sig'].mean(),
-            'avg_effect': trial_results['tmle_none_effect'].mean(),
-            'avg_se': trial_results['tmle_none_se'].mean()
-        })
-        
-        # TMLE fit
-        power_results.append({
-            'n_trial': n_trial,
-            'estimator': 'tmle_fit',
-            'power': trial_results['tmle_fit_sig'].mean(),
-            'avg_effect': trial_results['tmle_fit_effect'].mean(),
-            'avg_se': trial_results['tmle_fit_se'].mean()
-        })
-    
-    power_df = pd.DataFrame(power_results)
-    
-    # Create visualization
-    create_power_plot(power_df, kappa3, sig3, sigma03, sigma13)
-    
-    # Print results table
-    print_results_table(power_df)
-    
-    # Save results
-    output_dir = Path('results')
-    output_dir.mkdir(exist_ok=True)
-    
-    results_df.to_csv(output_dir / 'experiment_results.csv', index=False)
-    power_df.to_csv(output_dir / 'power_results.csv', index=False)
-    
-    # Save metrics
-    metrics_df = pd.DataFrame({
-        'metric': ['kappa3', 'sig3', 'sigma03', 'sigma13', 'gamma3'],
-        'value': [kappa3, sig3, sigma03, sigma13, gamma3]
-    })
-    metrics_df.to_csv(output_dir / 'metrics.csv', index=False)
-    
-    logger.info(f"\nResults saved to {output_dir}")
-    logger.info("Simulation complete!")
-    
-    return results_df, power_df, kappa3, sig3, sigma03, sigma13, gamma3
+rancherMonitoring:
+  enabled: true
+```
 
+## Step 3: Environment-Specific Values
 
-if __name__ == "__main__":
-    results_df, power_df, kappa3, sig3, sigma03, sigma13, gamma3 = main()
+```yaml
+# values-dev.yaml
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 7d
+    retentionSize: "50GB"
+    
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 100Gi
+    
+    # Dev cluster federation targets
+    additionalScrapeConfigs:
+      - job_name: 'federate-dev-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{__name__=~"node_.*"}'
+            - '{__name__=~"kube_.*"}'
+            - '{__name__=~"container_.*"}'
+        static_configs:
+          - targets:
+            - 'dev-cluster-1.local:30090'
+            - 'dev-cluster-2.local:30090'
+
+grafana:
+  adminPassword: "devpassword"  # Change this!
+```
+
+```yaml
+# values-prod.yaml
+prometheus:
+  prometheusSpec:
+    replicas: 2
+    retention: 30d
+    retentionSize: "500GB"
+    
+    # HA configuration
+    replicaExternalLabelName: "prometheus_replica"
+    prometheusExternalLabelName: "prometheus"
+    
+    # Production federation targets
+    additionalScrapeConfigs:
+      - job_name: 'federate-prod-clusters'
+        scrape_interval: 30s
+        honor_labels: true
+        metrics_path: '/federate'
+        params:
+          'match[]':
+            - '{__name__=~"node_.*"}'
+            - '{__name__=~"kube_.*"}'
+            - '{__name__=~"container_.*"}'
+            - '{__name__=~"up"}'
+        static_configs:
+          - targets:
+            - 'prod-cluster-1.local:30090'
+            - 'prod-cluster-2.local:30090'
+            - 'prod-cluster-3.local:30090'
+
+grafana:
+  adminPassword: "prodpassword"  # Use a secret!
+  
+  # Additional production settings
+  ingress:
+    enabled: false  # Using NodePort as specified
+```
+
+## Step 4: Version Management File
+
+```yaml
+# version.yaml
+# This file manages the Helm chart version
+# Update this when you want to upgrade the monitoring stack
+
+rancher_monitoring:
+  chart_version: "103.0.3+up45.31.1"
+  app_version: "v0.65.1"
+  
+# Version history for rollback reference
+version_history:
+  - version: "103.0.3+up45.31.1"
+    date: "2024-01-15"
+    notes: "Initial deployment"
+  - version: "102.0.2+up40.1.2"
+    date: "2023-12-01"
+    notes: "Previous stable version"
+```
+
+## Step 5: GitLab CI/CD Pipeline
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - validate
+  - update-version
+  - deploy
+
+variables:
+  GIT_STRATEGY: clone
+  FLEET_NAMESPACE: fleet-default
+
+# Validate Helm values
+validate:
+  stage: validate
+  image: alpine/helm:latest
+  script:
+    - echo "Validating Helm values files..."
+    - helm lint . || true
+    - echo "Checking YAML syntax..."
+    - |
+      for file in *.yaml; do
+        echo "Validating $file"
+        cat $file | yaml lint - || exit 1
+      done
+  only:
+    - merge_requests
+    - main
+
+# Update Fleet configuration with new version
+update-version:
+  stage: update-version
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yq git
+  script:
+    - |
+      # Extract version from version.yaml
+      CHART_VERSION=$(yq eval '.rancher_monitoring.chart_version' version.yaml)
+      echo "Chart version: $CHART_VERSION"
+      
+      # Update fleet.yaml with new version
+      yq eval -i ".helm.version = \"$CHART_VERSION\"" fleet.yaml
+      
+      # Commit if changed
+      if [[ $(git status --porcelain) ]]; then
+        git config user.email "ci@example.com"
+        git config user.name "GitLab CI"
+        git add fleet.yaml
+        git commit -m "Update rancher-monitoring to version $CHART_VERSION"
+      fi
+  only:
+    - main
+  artifacts:
+    paths:
+      - fleet.yaml
+
+# Deploy to Rancher using Fleet
+deploy:
+  stage: deploy
+  image: rancher/kubectl:v1.27.0
+  script:
+    - |
+      # Create or update Fleet GitRepo
+      cat <<EOF | kubectl apply -f -
+      apiVersion: fleet.cattle.io/v1alpha1
+      kind: GitRepo
+      metadata:
+        name: prometheus-federation
+        namespace: ${FLEET_NAMESPACE}
+      spec:
+        repo: ${CI_PROJECT_URL}.git
+        branch: ${CI_COMMIT_REF_NAME}
+        clientSecretName: gitlab-secret
+        paths:
+        - .
+        targets:
+        - name: management
+          clusterSelector:
+            matchLabels:
+              management: "true"
+      EOF
+      
+      # Wait for deployment
+      echo "Waiting for Fleet to sync..."
+      kubectl -n ${FLEET_NAMESPACE} wait --for=condition=Ready gitrepo/prometheus-federation --timeout=300s
+  only:
+    - main
+  when: manual
+```
+
+## Step 6: Setup Instructions
+
+### 1. Create GitLab Repository
+
+```bash
+# Initialize your GitLab repository
+git init rancher-prometheus-federation
+cd rancher-prometheus-federation
+
+# Create all the files above
+touch fleet.yaml values.yaml values-dev.yaml values-prod.yaml version.yaml .gitlab-ci.yml README.md
+
+# Copy the content into each file
+
+# Initial commit
+git add .
+git commit -m "Initial Prometheus federation setup"
+git remote add origin https://gitlab.com/your-org/rancher-prometheus-federation.git
+git push -u origin main
+```
+
+### 2. Create GitLab Secret in Rancher
+
+```bash
+# Create secret for Fleet to access GitLab
+kubectl create secret generic gitlab-secret \
+  -n fleet-default \
+  --from-literal=username=<gitlab-username> \
+  --from-literal=password=<gitlab-token>
+```
+
+### 3. Label Your Clusters
+
+```bash
+# Label your management cluster
+kubectl label cluster <cluster-name> management=true
+
+# Label environment clusters
+kubectl label cluster <dev-cluster> environment=dev
+kubectl label cluster <prod-cluster> environment=prod
+```
+
+### 4. Deploy Using Fleet
+
+```bash
+# Apply the GitRepo to trigger Fleet deployment
+kubectl apply -f - <<EOF
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: prometheus-federation
+  namespace: fleet-default
+spec:
+  repo: https://gitlab.com/your-org/rancher-prometheus-federation.git
+  branch: main
+  clientSecretName: gitlab-secret
+  paths:
+  - .
+  targets:
+  - name: management
+    clusterSelector:
+      matchLabels:
+        management: "true"
+EOF
+```
+
+## Step 7: Updating Versions
+
+When you want to update to a new version of rancher-monitoring:
+
+1. **Check available versions:**
+   ```bash
+   helm search repo rancher/rancher-monitoring --versions
+   ```
+
+2. **Update version.yaml:**
+   ```yaml
+   rancher_monitoring:
+     chart_version: "103.0.4+up45.31.2"  # New version
+     app_version: "v0.65.2"
+   ```
+
+3. **Commit and push:**
+   ```bash
+   git add version.yaml
+   git commit -m "Update rancher-monitoring to 103.0.4+up45.31.2"
+   git push
+   ```
+
+4. **GitLab CI will automatically update fleet.yaml and Fleet will deploy**
+
+## Access Your Monitoring
+
+After deployment:
+- **Prometheus**: `https://prometheus.acidev.mycompany.org`
+- **Grafana**: `https://grafana.acidev.mycompany.org`
+- **Alertmanager**: Internal access only (or enable ingress if needed)
+
+## Storage Recommendations
+
+Based on typical metrics volume for federated Prometheus:
+
+### Storage Calculation
+- **Prometheus**: 500Gi
+  - ~2GB per million samples
+  - Federation from 5 clusters
+  - 30-day retention
+  - Buffer for growth
+
+- **Grafana**: 50Gi
+  - Dashboards and configurations
+  - Query result cache
+  - User sessions and preferences
+
+- **AlertManager**: 20Gi
+  - Alert history
+  - Silence data
+  - Notification logs
+
+### Longhorn Best Practices
+1. **Replicas**: Set to 2 or 3 for data redundancy
+2. **Snapshots**: Configure daily snapshots with 7-day retention
+3. **Backup**: Set up recurring backups to external storage
+
+Example Longhorn configuration:
+```bash
+# Create storage class with specific replica count
+kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-prometheus
+provisioner: driver.longhorn.io
+parameters:
+  numberOfReplicas: "3"
+  staleReplicaTimeout: "2880"  # 48 hours
+  fromBackup: ""
+  diskSelector: ""
+  nodeSelector: ""
+  recurringJobSelector: '[{"name":"backup-prometheus","isGroup":false}]'
+EOF
+```
+
+## Security Considerations
+
+Since you're using ingress with TLS:
+
+1. **Network Policies** (optional):
+   ```yaml
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata:
+     name: prometheus-ingress-only
+     namespace: cattle-monitoring-system
+   spec:
+     podSelector:
+       matchLabels:
+         app.kubernetes.io/name: prometheus
+     policyTypes:
+     - Ingress
+     ingress:
+     - from:
+       - namespaceSelector:
+           matchLabels:
+             name: ingress-nginx
+       ports:
+       - protocol: TCP
+         port: 9090
+   ```
+
+2. **Authentication**: Consider adding basic auth to ingress:
+   ```yaml
+   # In your values.yaml under prometheus.ingress.annotations:
+   annotations:
+     nginx.ingress.kubernetes.io/auth-type: basic
+     nginx.ingress.kubernetes.io/auth-secret: basic-auth
+     nginx.ingress.kubernetes.io/auth-realm: 'Authentication Required'
+   ```
+
+## Next Steps
+
+Once this is working, you can:
+1. Add federation targets for your other clusters
+2. Create custom Grafana dashboards
+3. Set up alerting rules
+4. Add authentication/security
+
+This setup gives you a simple, maintainable way to deploy federated Prometheus with version control through GitLab and automated deployment through Fleet.
