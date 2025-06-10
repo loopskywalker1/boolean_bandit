@@ -1,613 +1,88 @@
-# Simple Federated Prometheus Setup for Rancher with Fleet
+---
+- name: Check security tools installation and service status
+  hosts: all
+  become: yes
+  vars:
+    security_services:
+      - name: "BigFix"
+        service: "etaclient"
+      - name: "CrowdStrike"
+        service: "falcon-sensor"
+      - name: "Qualys"
+        service: "qualys-cloud-agent"
+      - name: "Splunk"
+        service: "splunkd"
+      - name: "Tanium"
+        service: "tanium"
 
-## Repository Structure in GitLab
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
 
-```
-rancher-prometheus-federation/
-├── README.md
-├── .gitlab-ci.yml
-├── fleet.yaml                    # Fleet configuration
-├── values.yaml                   # Default values
-├── values-dev.yaml              # Dev environment overrides
-├── values-prod.yaml             # Prod environment overrides
-└── version.yaml                 # Version management file
-```
+    - name: Display security services status
+      ansible.builtin.debug:
+        msg: |
+          =====================================
+          SECURITY TOOLS STATUS REPORT
+          =====================================
+          {% for tool in security_services %}
+          {{ "%-15s" | format(tool.name + ":") }} 
+          {%- if tool.service + '.service' in ansible_facts.services %}
+            Status: {{ ansible_facts.services[tool.service + '.service'].state | upper }}
+            Enabled: {{ 'YES' if ansible_facts.services[tool.service + '.service'].status == 'enabled' else 'NO' }}
+          {%- else %}
+            Status: NOT INSTALLED
+            Enabled: N/A
+          {%- endif %}
+          {% endfor %}
+          =====================================
 
-## Step 1: Create Fleet Configuration
+    - name: Create detailed status summary
+      ansible.builtin.set_fact:
+        service_summary: |
+          {% set installed = [] %}
+          {% set running = [] %}
+          {% set stopped = [] %}
+          {% set missing = [] %}
+          {% for tool in security_services %}
+          {%- if tool.service + '.service' in ansible_facts.services %}
+          {%- set _ = installed.append(tool.name) %}
+          {%- if ansible_facts.services[tool.service + '.service'].state == 'running' %}
+          {%- set _ = running.append(tool.name) %}
+          {%- else %}
+          {%- set _ = stopped.append(tool.name) %}
+          {%- endif %}
+          {%- else %}
+          {%- set _ = missing.append(tool.name) %}
+          {%- endif %}
+          {%- endfor %}
+          
+          SUMMARY:
+          --------
+          Installed & Running: {{ running | join(', ') if running else 'None' }}
+          Installed but Stopped: {{ stopped | join(', ') if stopped else 'None' }}
+          Not Installed: {{ missing | join(', ') if missing else 'None' }}
+          
+          Total Installed: {{ installed | length }}/{{ security_services | length }}
 
-```yaml
-# fleet.yaml
-defaultNamespace: cattle-monitoring-system
+    - name: Display summary
+      ansible.builtin.debug:
+        var: service_summary
 
-helm:
-  repo: https://charts.rancher.io
-  chart: rancher-monitoring
-  version: 103.0.3+up45.31.1    # This will be managed via version.yaml
-  releaseName: rancher-monitoring
-  valuesFiles:
-    - values.yaml
-  
-diff:
-  comparePatches:
-  - apiVersion: admissionregistration.k8s.io/v1
-    kind: ValidatingWebhookConfiguration
-    name: rancher-monitoring-admission
-    operations:
-    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
-  - apiVersion: admissionregistration.k8s.io/v1
-    kind: MutatingWebhookConfiguration 
-    name: rancher-monitoring-admission
-    operations:
-    - {"op": "remove", "path": "/webhooks/0/failurePolicy"}
-
-targetCustomizations:
-- name: dev
-  clusterSelector:
-    matchLabels:
-      environment: dev
-  helm:
-    valuesFiles:
-    - values.yaml
-    - values-dev.yaml
-
-- name: prod
-  clusterSelector:
-    matchLabels:
-      environment: prod
-  helm:
-    valuesFiles:
-    - values.yaml
-    - values-prod.yaml
-```
-
-## Step 2: Create Base Values File
-
-```yaml
-# values.yaml
-# Rancher Monitoring - Prometheus Federation Configuration
-
-prometheus:
-  prometheusSpec:
-    # Enable federation
-    enableFeatures:
-      - remote-write-receiver
-      - federation
-    
-    # Retention settings
-    retention: 30d
-    retentionSize: "400GB"
-    
-    # Resources
-    resources:
-      requests:
-        cpu: 2000m
-        memory: 4Gi
-      limits:
-        cpu: 4000m
-        memory: 8Gi
-    
-    # Storage with Longhorn - sized for 30 days retention
-    storageSpec:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: longhorn
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 500Gi  # Increased for federation data
-    
-    # External labels to identify this Prometheus
-    externalLabels:
-      cluster: "management"
-      prometheus: "rancher-monitoring"
-    
-    # Scrape configs for federation
-    additionalScrapeConfigs:
-      # Federate from cluster Prometheus instances
-      - job_name: 'federate-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{job=~".+"}'  # Adjust this to be more selective
-        static_configs:
-          - targets: []  # Will be populated per environment
-  
-  # Ingress configuration for Prometheus
-  ingress:
-    enabled: true
-    ingressClassName: nginx
-    annotations:
-      cert-manager.io/cluster-issuer: "letsencrypt-prod"  # If using cert-manager
-    hosts:
-      - prometheus.acidev.mycompany.org
-    paths:
-      - /
-    tls:
-      - secretName: acidev-tls
-        hosts:
-          - prometheus.acidev.mycompany.org
-  
-  # Service configuration
-  service:
-    type: ClusterIP  # Changed from NodePort since we're using Ingress
-
-grafana:
-  enabled: true
-  
-  # Admin credentials - use a secret in production
-  adminPassword: "changeme"
-  
-  # Persistence with adequate storage
-  persistence:
-    enabled: true
-    storageClassName: longhorn
-    size: 50Gi  # Increased for dashboards and data
-  
-  # Ingress configuration for Grafana
-  ingress:
-    enabled: true
-    ingressClassName: nginx
-    annotations:
-      cert-manager.io/cluster-issuer: "letsencrypt-prod"  # If using cert-manager
-    hosts:
-      - grafana.acidev.mycompany.org
-    path: /
-    tls:
-      - secretName: acidev-tls
-        hosts:
-          - grafana.acidev.mycompany.org
-  
-  # Service configuration
-  service:
-    type: ClusterIP  # Changed from NodePort since we're using Ingress
-  
-  # Default dashboards
-  defaultDashboardsEnabled: true
-  
-  # Sidecar for loading dashboards
-  sidecar:
-    dashboards:
-      enabled: true
-      label: grafana_dashboard
-      labelValue: "1"
-    datasources:
-      enabled: true
-      label: grafana_datasource
-      labelValue: "1"
-
-alertmanager:
-  enabled: true
-  alertmanagerSpec:
-    storage:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: longhorn
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 20Gi  # Increased for alert history
-  
-  # Optional: Also expose AlertManager via Ingress
-  ingress:
-    enabled: false  # Enable if you want external access
-    ingressClassName: nginx
-    hosts:
-      - alertmanager.acidev.mycompany.org
-    paths:
-      - /
-    tls:
-      - secretName: acidev-tls
-        hosts:
-          - alertmanager.acidev.mycompany.org
-  
-  service:
-    type: ClusterIP
-
-# Disable components we don't need for simplicity
-kubeStateMetrics:
-  enabled: true
-
-nodeExporter:
-  enabled: true
-
-prometheusOperator:
-  enabled: true
-  manageCrds: true
-
-# Disable these for now to keep it simple
-pushgateway:
-  enabled: false
-
-ingressNginx:
-  enabled: false
-
-rancherMonitoring:
-  enabled: true
-```
-
-## Step 3: Environment-Specific Values
-
-```yaml
-# values-dev.yaml
-prometheus:
-  prometheusSpec:
-    replicas: 1
-    retention: 7d
-    retentionSize: "50GB"
-    
-    resources:
-      requests:
-        cpu: 500m
-        memory: 1Gi
-      limits:
-        cpu: 1000m
-        memory: 2Gi
-    
-    storageSpec:
-      volumeClaimTemplate:
-        spec:
-          resources:
-            requests:
-              storage: 100Gi
-    
-    # Dev cluster federation targets
-    additionalScrapeConfigs:
-      - job_name: 'federate-dev-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{__name__=~"node_.*"}'
-            - '{__name__=~"kube_.*"}'
-            - '{__name__=~"container_.*"}'
-        static_configs:
-          - targets:
-            - 'dev-cluster-1.local:30090'
-            - 'dev-cluster-2.local:30090'
-
-grafana:
-  adminPassword: "devpassword"  # Change this!
-```
-
-```yaml
-# values-prod.yaml
-prometheus:
-  prometheusSpec:
-    replicas: 2
-    retention: 30d
-    retentionSize: "500GB"
-    
-    # HA configuration
-    replicaExternalLabelName: "prometheus_replica"
-    prometheusExternalLabelName: "prometheus"
-    
-    # Production federation targets
-    additionalScrapeConfigs:
-      - job_name: 'federate-prod-clusters'
-        scrape_interval: 30s
-        honor_labels: true
-        metrics_path: '/federate'
-        params:
-          'match[]':
-            - '{__name__=~"node_.*"}'
-            - '{__name__=~"kube_.*"}'
-            - '{__name__=~"container_.*"}'
-            - '{__name__=~"up"}'
-        static_configs:
-          - targets:
-            - 'prod-cluster-1.local:30090'
-            - 'prod-cluster-2.local:30090'
-            - 'prod-cluster-3.local:30090'
-
-grafana:
-  adminPassword: "prodpassword"  # Use a secret!
-  
-  # Additional production settings
-  ingress:
-    enabled: false  # Using NodePort as specified
-```
-
-## Step 4: Version Management File
-
-```yaml
-# version.yaml
-# This file manages the Helm chart version
-# Update this when you want to upgrade the monitoring stack
-
-rancher_monitoring:
-  chart_version: "103.0.3+up45.31.1"
-  app_version: "v0.65.1"
-  
-# Version history for rollback reference
-version_history:
-  - version: "103.0.3+up45.31.1"
-    date: "2024-01-15"
-    notes: "Initial deployment"
-  - version: "102.0.2+up40.1.2"
-    date: "2023-12-01"
-    notes: "Previous stable version"
-```
-
-## Step 5: GitLab CI/CD Pipeline
-
-```yaml
-# .gitlab-ci.yml
-stages:
-  - validate
-  - update-version
-  - deploy
-
-variables:
-  GIT_STRATEGY: clone
-  FLEET_NAMESPACE: fleet-default
-
-# Validate Helm values
-validate:
-  stage: validate
-  image: alpine/helm:latest
-  script:
-    - echo "Validating Helm values files..."
-    - helm lint . || true
-    - echo "Checking YAML syntax..."
-    - |
-      for file in *.yaml; do
-        echo "Validating $file"
-        cat $file | yaml lint - || exit 1
-      done
-  only:
-    - merge_requests
-    - main
-
-# Update Fleet configuration with new version
-update-version:
-  stage: update-version
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache yq git
-  script:
-    - |
-      # Extract version from version.yaml
-      CHART_VERSION=$(yq eval '.rancher_monitoring.chart_version' version.yaml)
-      echo "Chart version: $CHART_VERSION"
+    - name: Individual service status check (alternative method)
+      ansible.builtin.systemd:
+        name: "{{ item.service }}"
+      register: service_status
+      failed_when: false
+      loop: "{{ security_services }}"
       
-      # Update fleet.yaml with new version
-      yq eval -i ".helm.version = \"$CHART_VERSION\"" fleet.yaml
-      
-      # Commit if changed
-      if [[ $(git status --porcelain) ]]; then
-        git config user.email "ci@example.com"
-        git config user.name "GitLab CI"
-        git add fleet.yaml
-        git commit -m "Update rancher-monitoring to version $CHART_VERSION"
-      fi
-  only:
-    - main
-  artifacts:
-    paths:
-      - fleet.yaml
-
-# Deploy to Rancher using Fleet
-deploy:
-  stage: deploy
-  image: rancher/kubectl:v1.27.0
-  script:
-    - |
-      # Create or update Fleet GitRepo
-      cat <<EOF | kubectl apply -f -
-      apiVersion: fleet.cattle.io/v1alpha1
-      kind: GitRepo
-      metadata:
-        name: prometheus-federation
-        namespace: ${FLEET_NAMESPACE}
-      spec:
-        repo: ${CI_PROJECT_URL}.git
-        branch: ${CI_COMMIT_REF_NAME}
-        clientSecretName: gitlab-secret
-        paths:
-        - .
-        targets:
-        - name: management
-          clusterSelector:
-            matchLabels:
-              management: "true"
-      EOF
-      
-      # Wait for deployment
-      echo "Waiting for Fleet to sync..."
-      kubectl -n ${FLEET_NAMESPACE} wait --for=condition=Ready gitrepo/prometheus-federation --timeout=300s
-  only:
-    - main
-  when: manual
-```
-
-## Step 6: Setup Instructions
-
-### 1. Create GitLab Repository
-
-```bash
-# Initialize your GitLab repository
-git init rancher-prometheus-federation
-cd rancher-prometheus-federation
-
-# Create all the files above
-touch fleet.yaml values.yaml values-dev.yaml values-prod.yaml version.yaml .gitlab-ci.yml README.md
-
-# Copy the content into each file
-
-# Initial commit
-git add .
-git commit -m "Initial Prometheus federation setup"
-git remote add origin https://gitlab.com/your-org/rancher-prometheus-federation.git
-git push -u origin main
-```
-
-### 2. Create GitLab Secret in Rancher
-
-```bash
-# Create secret for Fleet to access GitLab
-kubectl create secret generic gitlab-secret \
-  -n fleet-default \
-  --from-literal=username=<gitlab-username> \
-  --from-literal=password=<gitlab-token>
-```
-
-### 3. Label Your Clusters
-
-```bash
-# Label your management cluster
-kubectl label cluster <cluster-name> management=true
-
-# Label environment clusters
-kubectl label cluster <dev-cluster> environment=dev
-kubectl label cluster <prod-cluster> environment=prod
-```
-
-### 4. Deploy Using Fleet
-
-```bash
-# Apply the GitRepo to trigger Fleet deployment
-kubectl apply -f - <<EOF
-apiVersion: fleet.cattle.io/v1alpha1
-kind: GitRepo
-metadata:
-  name: prometheus-federation
-  namespace: fleet-default
-spec:
-  repo: https://gitlab.com/your-org/rancher-prometheus-federation.git
-  branch: main
-  clientSecretName: gitlab-secret
-  paths:
-  - .
-  targets:
-  - name: management
-    clusterSelector:
-      matchLabels:
-        management: "true"
-EOF
-```
-
-## Step 7: Updating Versions
-
-When you want to update to a new version of rancher-monitoring:
-
-1. **Check available versions:**
-   ```bash
-   helm search repo rancher/rancher-monitoring --versions
-   ```
-
-2. **Update version.yaml:**
-   ```yaml
-   rancher_monitoring:
-     chart_version: "103.0.4+up45.31.2"  # New version
-     app_version: "v0.65.2"
-   ```
-
-3. **Commit and push:**
-   ```bash
-   git add version.yaml
-   git commit -m "Update rancher-monitoring to 103.0.4+up45.31.2"
-   git push
-   ```
-
-4. **GitLab CI will automatically update fleet.yaml and Fleet will deploy**
-
-## Access Your Monitoring
-
-After deployment:
-- **Prometheus**: `https://prometheus.acidev.mycompany.org`
-- **Grafana**: `https://grafana.acidev.mycompany.org`
-- **Alertmanager**: Internal access only (or enable ingress if needed)
-
-## Storage Recommendations
-
-Based on typical metrics volume for federated Prometheus:
-
-### Storage Calculation
-- **Prometheus**: 500Gi
-  - ~2GB per million samples
-  - Federation from 5 clusters
-  - 30-day retention
-  - Buffer for growth
-
-- **Grafana**: 50Gi
-  - Dashboards and configurations
-  - Query result cache
-  - User sessions and preferences
-
-- **AlertManager**: 20Gi
-  - Alert history
-  - Silence data
-  - Notification logs
-
-### Longhorn Best Practices
-1. **Replicas**: Set to 2 or 3 for data redundancy
-2. **Snapshots**: Configure daily snapshots with 7-day retention
-3. **Backup**: Set up recurring backups to external storage
-
-Example Longhorn configuration:
-```bash
-# Create storage class with specific replica count
-kubectl apply -f - <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: longhorn-prometheus
-provisioner: driver.longhorn.io
-parameters:
-  numberOfReplicas: "3"
-  staleReplicaTimeout: "2880"  # 48 hours
-  fromBackup: ""
-  diskSelector: ""
-  nodeSelector: ""
-  recurringJobSelector: '[{"name":"backup-prometheus","isGroup":false}]'
-EOF
-```
-
-## Security Considerations
-
-Since you're using ingress with TLS:
-
-1. **Network Policies** (optional):
-   ```yaml
-   apiVersion: networking.k8s.io/v1
-   kind: NetworkPolicy
-   metadata:
-     name: prometheus-ingress-only
-     namespace: cattle-monitoring-system
-   spec:
-     podSelector:
-       matchLabels:
-         app.kubernetes.io/name: prometheus
-     policyTypes:
-     - Ingress
-     ingress:
-     - from:
-       - namespaceSelector:
-           matchLabels:
-             name: ingress-nginx
-       ports:
-       - protocol: TCP
-         port: 9090
-   ```
-
-2. **Authentication**: Consider adding basic auth to ingress:
-   ```yaml
-   # In your values.yaml under prometheus.ingress.annotations:
-   annotations:
-     nginx.ingress.kubernetes.io/auth-type: basic
-     nginx.ingress.kubernetes.io/auth-secret: basic-auth
-     nginx.ingress.kubernetes.io/auth-realm: 'Authentication Required'
-   ```
-
-## Next Steps
-
-Once this is working, you can:
-1. Add federation targets for your other clusters
-2. Create custom Grafana dashboards
-3. Set up alerting rules
-4. Add authentication/security
-
-This setup gives you a simple, maintainable way to deploy federated Prometheus with version control through GitLab and automated deployment through Fleet.
+    - name: Display individual service details
+      ansible.builtin.debug:
+        msg: |
+          Service: {{ item.item.name }} ({{ item.item.service }})
+          Active: {{ item.status.ActiveState | default('unknown') }}
+          Enabled: {{ item.status.UnitFileState | default('unknown') }}
+          Load State: {{ item.status.LoadState | default('unknown') }}
+          ---
+      loop: "{{ service_status.results }}"
+      when: item.status is defined
