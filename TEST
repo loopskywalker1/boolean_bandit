@@ -1,88 +1,24 @@
 ---
-- name: Check security tools installation and service status
+- name: Simple security tools status check
   hosts: all
   become: yes
   vars:
     security_services:
-      - name: "BigFix"
-        service: "etaclient"
-      - name: "CrowdStrike"
-        service: "falcon-sensor"
-      - name: "Qualys"
-        service: "qualys-cloud-agent"
-      - name: "Splunk"
-        service: "splunkd"
-      - name: "Tanium"
-        service: "tanium"
+      - { name: "BigFix", service: "etaclient" }
+      - { name: "CrowdStrike", service: "falcon-sensor" }
+      - { name: "Qualys", service: "qualys-cloud-agent" }
+      - { name: "Splunk", service: "splunkd" }
+      - { name: "Tanium", service: "tanium" }
 
   tasks:
-    - name: Gather service facts
-      ansible.builtin.service_facts:
-
-    - name: Display security services status
-      ansible.builtin.debug:
-        msg: |
-          =====================================
-          SECURITY TOOLS STATUS REPORT
-          =====================================
-          {% for tool in security_services %}
-          {{ "%-15s" | format(tool.name + ":") }} 
-          {%- if tool.service + '.service' in ansible_facts.services %}
-            Status: {{ ansible_facts.services[tool.service + '.service'].state | upper }}
-            Enabled: {{ 'YES' if ansible_facts.services[tool.service + '.service'].status == 'enabled' else 'NO' }}
-          {%- else %}
-            Status: NOT INSTALLED
-            Enabled: N/A
-          {%- endif %}
-          {% endfor %}
-          =====================================
-
-    - name: Create detailed status summary
-      ansible.builtin.set_fact:
-        service_summary: |
-          {% set installed = [] %}
-          {% set running = [] %}
-          {% set stopped = [] %}
-          {% set missing = [] %}
-          {% for tool in security_services %}
-          {%- if tool.service + '.service' in ansible_facts.services %}
-          {%- set _ = installed.append(tool.name) %}
-          {%- if ansible_facts.services[tool.service + '.service'].state == 'running' %}
-          {%- set _ = running.append(tool.name) %}
-          {%- else %}
-          {%- set _ = stopped.append(tool.name) %}
-          {%- endif %}
-          {%- else %}
-          {%- set _ = missing.append(tool.name) %}
-          {%- endif %}
-          {%- endfor %}
-          
-          SUMMARY:
-          --------
-          Installed & Running: {{ running | join(', ') if running else 'None' }}
-          Installed but Stopped: {{ stopped | join(', ') if stopped else 'None' }}
-          Not Installed: {{ missing | join(', ') if missing else 'None' }}
-          
-          Total Installed: {{ installed | length }}/{{ security_services | length }}
-
-    - name: Display summary
-      ansible.builtin.debug:
-        var: service_summary
-
-    - name: Individual service status check (alternative method)
+    - name: Check if services exist and their status
       ansible.builtin.systemd:
         name: "{{ item.service }}"
-      register: service_status
+      register: service_check
       failed_when: false
       loop: "{{ security_services }}"
-      
-    - name: Display individual service details
+
+    - name: Display simple status
       ansible.builtin.debug:
-        msg: |
-          Service: {{ item.item.name }} ({{ item.item.service }})
-          Active: {{ item.status.ActiveState | default('unknown') }}
-          Enabled: {{ item.status.UnitFileState | default('unknown') }}
-          Load State: {{ item.status.LoadState | default('unknown') }}
-          ---
-      loop: "{{ service_status.results }}"
-      when: item.status is defined
+        msg: "{{ item.item.name }}: {% if item.status.LoadState == 'loaded' %}INSTALLED - {% if item.status.ActiveState == 'active' %}RUNNING{% else %}NOT RUNNING{% endif %}{% else %}NOT INSTALLED{% endif %}"
+      loop: "{{ service_check.results }}"
