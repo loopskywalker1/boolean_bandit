@@ -1,44 +1,24 @@
 ---
-- name: Simple security tools status check
+- name: Check NVIDIA SMI installation
   hosts: all
   become: yes
 
   tasks:
-    - name: Check BigFix
-      ansible.builtin.shell: systemctl is-active *etaclient* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q etaclient && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
-      register: bigfix_status
+    - name: Check if nvidia-smi is installed and working
+      ansible.builtin.shell: |
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          if nvidia-smi >/dev/null 2>&1; then
+            echo "INSTALLED - WORKING"
+          else
+            echo "INSTALLED - NOT WORKING"
+          fi
+        else
+          echo "NOT INSTALLED"
+        fi
+      register: nvidia_status
       changed_when: false
       failed_when: false
 
-    - name: Check CrowdStrike
-      ansible.builtin.shell: systemctl is-active *falcon-sensor* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q falcon-sensor && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
-      register: crowdstrike_status
-      changed_when: false
-      failed_when: false
-
-    - name: Check Qualys
-      ansible.builtin.shell: systemctl is-active *qualys-cloud-agent* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q qualys-cloud-agent && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
-      register: qualys_status
-      changed_when: false
-      failed_when: false
-
-    - name: Check Splunk
-      ansible.builtin.shell: systemctl is-active *splunk* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q splunk && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
-      register: splunk_status
-      changed_when: false
-      failed_when: false
-
-    - name: Check Tanium
-      ansible.builtin.shell: systemctl is-active *tanium* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q tanium && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
-      register: tanium_status
-      changed_when: false
-      failed_when: false
-
-    - name: Display results
+    - name: Display nvidia-smi status
       ansible.builtin.debug:
-        msg: |
-          BigFix: {{ bigfix_status.stdout }}
-          CrowdStrike: {{ crowdstrike_status.stdout }}
-          Qualys: {{ qualys_status.stdout }}
-          Splunk: {{ splunk_status.stdout }}
-          Tanium: {{ tanium_status.stdout }}
+        msg: "NVIDIA SMI: {{ nvidia_status.stdout }}"
