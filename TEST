@@ -2,23 +2,43 @@
 - name: Simple security tools status check
   hosts: all
   become: yes
-  vars:
-    security_services:
-      - { name: "BigFix", service: "etaclient" }
-      - { name: "CrowdStrike", service: "falcon-sensor" }
-      - { name: "Qualys", service: "qualys-cloud-agent" }
-      - { name: "Splunk", service: "splunkd" }
-      - { name: "Tanium", service: "tanium" }
 
   tasks:
-    - name: Check if services exist and their status
-      ansible.builtin.systemd:
-        name: "{{ item.service }}"
-      register: service_check
+    - name: Check BigFix
+      ansible.builtin.shell: systemctl is-active *etaclient* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q etaclient && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
+      register: bigfix_status
+      changed_when: false
       failed_when: false
-      loop: "{{ security_services }}"
 
-    - name: Display simple status
+    - name: Check CrowdStrike
+      ansible.builtin.shell: systemctl is-active *falcon-sensor* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q falcon-sensor && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
+      register: crowdstrike_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check Qualys
+      ansible.builtin.shell: systemctl is-active *qualys-cloud-agent* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q qualys-cloud-agent && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
+      register: qualys_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check Splunk
+      ansible.builtin.shell: systemctl is-active *splunk* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q splunk && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
+      register: splunk_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check Tanium
+      ansible.builtin.shell: systemctl is-active *tanium* 2>/dev/null && echo "INSTALLED - RUNNING" || (systemctl list-unit-files | grep -q tanium && echo "INSTALLED - NOT RUNNING" || echo "NOT INSTALLED")
+      register: tanium_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display results
       ansible.builtin.debug:
-        msg: "{{ item.item.name }}: {% if item.status.LoadState == 'loaded' %}INSTALLED - {% if item.status.ActiveState == 'active' %}RUNNING{% else %}NOT RUNNING{% endif %}{% else %}NOT INSTALLED{% endif %}"
-      loop: "{{ service_check.results }}"
+        msg: |
+          BigFix: {{ bigfix_status.stdout }}
+          CrowdStrike: {{ crowdstrike_status.stdout }}
+          Qualys: {{ qualys_status.stdout }}
+          Splunk: {{ splunk_status.stdout }}
+          Tanium: {{ tanium_status.stdout }}
