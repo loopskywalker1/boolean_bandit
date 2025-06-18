@@ -1,34 +1,51 @@
 ---
-- name: Simple security tools status check with wildcards
+- name: Simple security tools status check
   hosts: all
   become: yes
-  vars:
-    tools:
-      - { name: "BigFix", search: "etaclient|besagent|bigfix" }
-      - { name: "CrowdStrike", search: "falcon|crowdstrike" }
-      - { name: "Qualys", search: "qualys" }
-      - { name: "Splunk", search: "splunk" }
-      - { name: "Tanium", search: "tanium" }
 
   tasks:
-    - name: Check each security tool
+    - name: Check BigFix
+      ansible.builtin.shell: systemctl status besclient >/dev/null 2>&1 && (systemctl is-active besclient >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING") || echo "NOT INSTALLED"
+      register: bigfix_result
+      changed_when: false
+      failed_when: false
+
+    - name: Check CrowdStrike
+      ansible.builtin.shell: systemctl status falcon-sensor >/dev/null 2>&1 && (systemctl is-active falcon-sensor >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING") || echo "NOT INSTALLED"
+      register: crowdstrike_result
+      changed_when: false
+      failed_when: false
+
+    - name: Check Qualys
+      ansible.builtin.shell: systemctl status qualys-cloud-agent >/dev/null 2>&1 && (systemctl is-active qualys-cloud-agent >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING") || echo "NOT INSTALLED"
+      register: qualys_result
+      changed_when: false
+      failed_when: false
+
+    - name: Check Splunk
       ansible.builtin.shell: |
-        service=$(systemctl list-units --type=service --all | grep -iE "{{ item.search }}" | head -1 | awk '{print $1}')
-        if [ -n "$service" ]; then
-          if systemctl is-active "$service" >/dev/null 2>&1; then
-            echo "INSTALLED - RUNNING"
-          else
-            echo "INSTALLED - NOT RUNNING"
-          fi
+        if systemctl status Splunkd >/dev/null 2>&1; then
+          systemctl is-active Splunkd >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING"
+        elif systemctl status splunkd >/dev/null 2>&1; then
+          systemctl is-active splunkd >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING"
         else
           echo "NOT INSTALLED"
         fi
-      loop: "{{ tools }}"
-      register: status_check
+      register: splunk_result
+      changed_when: false
+      failed_when: false
+
+    - name: Check Tanium
+      ansible.builtin.shell: systemctl status taniumclient >/dev/null 2>&1 && (systemctl is-active taniumclient >/dev/null 2>&1 && echo "INSTALLED - RUNNING" || echo "INSTALLED - NOT RUNNING") || echo "NOT INSTALLED"
+      register: tanium_result
       changed_when: false
       failed_when: false
 
     - name: Display results
       ansible.builtin.debug:
-        msg: "{{ item.item.name }}: {{ item.stdout }}"
-      loop: "{{ status_check.results }}"
+        msg: |
+          BigFix: {{ bigfix_result.stdout }}
+          CrowdStrike: {{ crowdstrike_result.stdout }}
+          Qualys: {{ qualys_result.stdout }}
+          Splunk: {{ splunk_result.stdout }}
+          Tanium: {{ tanium_result.stdout }}
